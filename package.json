@@ -1,0 +1,12 @@
+{
+  "name": "trotro",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "dev:passenger": "npm --workspace apps/passenger run dev",
+    "dev:driver": "npm --workspace apps/driver run dev",
+    "build:passenger": "npm --workspace apps/passenger run build",
+    "build:driver": "npm --workspace apps/driver run build",
+    "build": "npm run build:passenger && npm run build:driver"
+  }
+}
