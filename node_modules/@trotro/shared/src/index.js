@@ -1,3 +1,4 @@
+export * from "./firebase";
 export * from "./constants.js";
 export * from "./supabaseClient.js";
 export * from "./utils.js";
