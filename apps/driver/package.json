@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --port 5174",
-    "build": "node $(node -p \"require.resolve('vite/bin/vite.js')\") build",
+    "build": "node -e \"const path=require('path'); const cp=require('child_process'); const pkg=require.resolve('vite/package.json'); const bin=path.join(path.dirname(pkg),'bin','vite.js'); const r=cp.spawnSync(process.execPath,[bin,'build'],{stdio:'inherit'}); process.exit(r.status||0);\"",
     "preview": "vite preview"
   },
   "dependencies": {
