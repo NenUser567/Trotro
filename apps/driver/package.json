@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --port 5174",
-    "build": "npx vite build",
+    "build": "node $(node -p \"require.resolve('vite/bin/vite.js')\") build",
     "preview": "vite preview"
   },
   "dependencies": {
