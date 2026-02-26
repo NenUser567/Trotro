@@ -10,6 +10,7 @@ import {
 } from "@trotro/shared";
 import { getToken, onMessage } from "firebase/messaging";
 
+/** Stable driver web device id */
 const getWebDeviceId = () => {
   const k = "trotro_web_device_id_driver";
   const v = localStorage.getItem(k);
@@ -26,8 +27,50 @@ const MOVE_MIN_M = 10;
 const HEARTBEAT_MS = 15000;
 const HIDDEN_HEARTBEAT_MS = 30000;
 
+// Fallback passenger refresh cadence (does NOT touch stops)
+const PASSENGER_POLL_MS = 25_000;
+
+// If realtime is silent too long, rely on polling anyway
 const REALTIME_SILENCE_MS = 30_000;
-const FALLBACK_POLL_MS = 25_000;
+
+/* ---------- Resilient fetch helpers (slow network friendly) ---------- */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function withRetry(
+  fn,
+  { tries = 4, baseDelayMs = 600, timeoutMs = 12000, onSlowNetwork } = {}
+) {
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= tries; attempt++) {
+    try {
+      const res = await Promise.race([
+        fn(),
+        (async () => {
+          await sleep(timeoutMs);
+          throw new Error("Request timed out");
+        })()
+      ]);
+      return res;
+    } catch (e) {
+      lastErr = e;
+      if (onSlowNetwork) onSlowNetwork(attempt, e?.message || String(e));
+      if (attempt === tries) break;
+
+      const jitter = Math.floor(Math.random() * 250);
+      const delay = baseDelayMs * Math.pow(2, attempt - 1) + jitter;
+      await sleep(delay);
+    }
+  }
+
+  throw lastErr || new Error("Request failed");
+}
+
+const genPickupCode = () => {
+  // 4-digit code (leading zeros allowed)
+  const n = Math.floor(Math.random() * 10000);
+  return String(n).padStart(4, "0");
+};
 
 const isStandalonePWA = () =>
   window.matchMedia?.("(display-mode: standalone)")?.matches ||
@@ -56,7 +99,9 @@ function Toast({ toast, onClose }) {
       >
         <div className="flex items-start justify-between gap-3">
           <div className="whitespace-pre-wrap">{toast.message}</div>
-          <button onClick={onClose} className="text-zinc-300 hover:text-white">✕</button>
+          <button onClick={onClose} className="text-zinc-300 hover:text-white">
+            ✕
+          </button>
         </div>
       </div>
     </div>
@@ -72,7 +117,9 @@ function InstallSheet({ open, onClose }) {
       <div className="absolute left-0 right-0 bottom-0 mx-auto max-w-md rounded-t-3xl border border-white/10 bg-zinc-950 p-4">
         <div className="flex items-center justify-between">
           <div className="text-sm font-black tracking-wide text-zinc-100">Install instructions</div>
-          <button onClick={onClose} className="text-zinc-400 hover:text-white">✕</button>
+          <button onClick={onClose} className="text-zinc-400 hover:text-white">
+            ✕
+          </button>
         </div>
 
         <div className="mt-4 space-y-4 text-sm text-zinc-200">
@@ -81,7 +128,10 @@ function InstallSheet({ open, onClose }) {
             <ol className="mt-2 list-decimal pl-5 space-y-1 text-zinc-300">
               <li>Open this site in Chrome.</li>
               <li>Tap the menu ⋮ (top-right).</li>
-              <li>Tap <span className="text-zinc-100 font-semibold">Install app</span> or <span className="text-zinc-100 font-semibold">Add to Home screen</span>.</li>
+              <li>
+                Tap <span className="text-zinc-100 font-semibold">Install app</span> or{" "}
+                <span className="text-zinc-100 font-semibold">Add to Home screen</span>.
+              </li>
               <li>Open it from the new icon for the best experience.</li>
             </ol>
           </div>
@@ -89,7 +139,8 @@ function InstallSheet({ open, onClose }) {
           <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
             <div className="font-semibold text-zinc-100">Note</div>
             <div className="mt-2 text-zinc-300">
-              Installing doesn’t magically fix GPS, but it reduces “tab killed / background throttling” issues and feels more reliable.
+              Installing doesn’t magically fix GPS, but it reduces “tab killed / background throttling” issues and feels
+              more reliable.
             </div>
           </div>
         </div>
@@ -119,7 +170,9 @@ function DestinationSheet({ open, onClose, destinations, selectedId, onSelect })
       <div className="absolute left-0 right-0 bottom-0 mx-auto max-w-md rounded-t-3xl border border-white/10 bg-zinc-950 p-4">
         <div className="flex items-center justify-between">
           <div className="text-sm font-black tracking-wide text-zinc-100">Select destination</div>
-          <button onClick={onClose} className="text-zinc-400 hover:text-white">✕</button>
+          <button onClick={onClose} className="text-zinc-400 hover:text-white">
+            ✕
+          </button>
         </div>
 
         <div className="mt-3">
@@ -133,9 +186,7 @@ function DestinationSheet({ open, onClose, destinations, selectedId, onSelect })
 
         <div className="mt-3 max-h-[55vh] overflow-auto pr-1">
           {filtered.length === 0 ? (
-            <div className="rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-zinc-400">
-              No matches.
-            </div>
+            <div className="rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-zinc-400">No matches.</div>
           ) : (
             <div className="space-y-2">
               {filtered.map((d) => {
@@ -178,6 +229,15 @@ export default function Driver() {
   const [selectedStop, setSelectedStop] = useState(null);
 
   const [pushEnabled, setPushEnabled] = useState(false);
+
+  // loading + errors (destinations/stops)
+  const [destLoading, setDestLoading] = useState(false);
+  const [stopLoading, setStopLoading] = useState(false);
+  const [destErr, setDestErr] = useState("");
+  const [stopErr, setStopErr] = useState("");
+
+  // Top pickup code display
+  const [topPickupCode, setTopPickupCode] = useState(null);
 
   // Broadcasting
   const [isBroadcasting, setIsBroadcasting] = useState(false);
@@ -295,28 +355,69 @@ export default function Driver() {
   };
 
   const refreshDestinations = async () => {
-    const { data, error } = await supabase.from("destinations").select("id,name").order("name");
-    if (error) return;
+    setDestErr("");
+    setDestLoading(true);
 
-    const list = data || [];
-    setDestinations(list);
+    try {
+      const list = await withRetry(
+        async () => {
+          const { data, error } = await supabase.from("destinations").select("id,name").order("name");
+          if (error) throw error;
+          return data || [];
+        },
+        {
+          tries: 4,
+          timeoutMs: 12000,
+          onSlowNetwork: (attempt) => notify("info", `Network seems slow… retrying destinations (${attempt}/4)`, 2200)
+        }
+      );
 
-    const saved = localStorage.getItem(DEFAULT_DEST_KEY);
-    if (saved && !selectedDest) {
-      const d = list.find((x) => x.id === saved);
-      if (d) selectDestination(d);
+      setDestinations(list);
+
+      const saved = localStorage.getItem(DEFAULT_DEST_KEY);
+      if (saved && !selectedDest) {
+        const d = list.find((x) => x.id === saved);
+        if (d) selectDestination(d);
+      }
+    } catch (e) {
+      setDestErr(e?.message || String(e));
+      notify("error", "Failed to load destinations. Tap to retry.", 5000);
+    } finally {
+      setDestLoading(false);
     }
   };
 
   const refreshStops = async (destId) => {
-    const { data, error } = await supabase
-      .from("route_stops")
-      .select("id,name,stop_order")
-      .eq("destination_id", destId)
-      .eq("route_id", ROUTE_ID)
-      .order("stop_order");
+    setStopErr("");
+    setStopLoading(true);
 
-    if (!error) setStops(data || []);
+    try {
+      const rows = await withRetry(
+        async () => {
+          const { data, error } = await supabase
+            .from("route_stops")
+            .select("id,name,stop_order")
+            .eq("destination_id", destId)
+            .eq("route_id", ROUTE_ID)
+            .order("stop_order");
+
+          if (error) throw error;
+          return data || [];
+        },
+        {
+          tries: 4,
+          timeoutMs: 12000,
+          onSlowNetwork: (attempt) => notify("info", `Network seems slow… retrying stops (${attempt}/4)`, 2200)
+        }
+      );
+
+      setStops(rows);
+    } catch (e) {
+      setStopErr(e?.message || String(e));
+      notify("error", "Failed to load stops. Tap to retry.", 5000);
+    } finally {
+      setStopLoading(false);
+    }
   };
 
   useEffect(() => {
@@ -325,58 +426,83 @@ export default function Driver() {
   }, []);
 
   useEffect(() => {
-    if (!selectedDest) return;
-    refreshStops(selectedDest.id);
-  }, [selectedDest]);
+    if (!selectedDest?.id) return;
+    refreshStops(selectedDest.id); // stops only reload when destination changes
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedDest?.id]);
 
-  /* ===== PASSENGERS (realtime + fallback poll only) ===== */
-  const [lastRealtimeAt, setLastRealtimeAt] = useState(0);
+  /* ===== PASSENGERS: realtime immediate + fallback poll (NO stops refresh) ===== */
+  const [lastPassengerRealtimeAt, setLastPassengerRealtimeAt] = useState(0);
   const [passengerRefreshTick, setPassengerRefreshTick] = useState(0);
+  const [passengerUpdatedAt, setPassengerUpdatedAt] = useState(0);
 
   useEffect(() => {
-    if (!selectedDest) return;
+    if (!selectedDest?.id) {
+      setPassengers([]);
+      return;
+    }
 
     let alive = true;
 
     const fetchPassengers = async () => {
       const now = new Date().toISOString();
+
       const { data, error } = await supabase
         .from("waiting_passengers")
         .select("*")
         .eq("destination_id", selectedDest.id)
         .eq("route_id", ROUTE_ID)
         .eq("active", true)
+        .eq("accepted", false)
         .gt("expires_at", now)
         .order("created_at", { ascending: true });
 
-      if (!error && alive) setPassengers(data || []);
+      if (!error && alive) {
+        setPassengers(data || []);
+        setPassengerUpdatedAt(Date.now());
+      }
     };
 
+    // initial
     fetchPassengers();
 
+    // realtime: subscribe ONLY to this destination+route so we aren't reacting to unrelated updates
     const channel = supabase
-      .channel("waiting_passengers_changes_driver_web")
+      .channel(`waiting_passengers_driver_${selectedDest.id}`)
       .on(
         "postgres_changes",
-        { event: "*", schema: "public", table: "waiting_passengers", filter: `route_id=eq.${ROUTE_ID}` },
+        {
+          event: "*",
+          schema: "public",
+          table: "waiting_passengers",
+          // Postgres filter supports AND with commas:
+          filter: `route_id=eq.${ROUTE_ID},destination_id=eq.${selectedDest.id}`
+        },
         () => {
-          setLastRealtimeAt(Date.now());
+          setLastPassengerRealtimeAt(Date.now());
           fetchPassengers();
         }
       )
       .subscribe();
 
-    const t = setInterval(() => {
-      const silence = Date.now() - (lastRealtimeAt || 0);
+    // fallback poll (25s) - does NOT touch stops and does not reset scroll
+    const poll = setInterval(() => {
+      fetchPassengers();
+    }, PASSENGER_POLL_MS);
+
+    // extra safety: if realtime silent, still fetch (but poll already covers)
+    const silenceGuard = setInterval(() => {
+      const silence = Date.now() - (lastPassengerRealtimeAt || 0);
       if (silence >= REALTIME_SILENCE_MS) fetchPassengers();
-    }, FALLBACK_POLL_MS);
+    }, PASSENGER_POLL_MS);
 
     return () => {
       alive = false;
-      clearInterval(t);
+      clearInterval(poll);
+      clearInterval(silenceGuard);
       supabase.removeChannel(channel);
     };
-  }, [selectedDest, lastRealtimeAt, passengerRefreshTick]);
+  }, [selectedDest?.id, passengerRefreshTick]);
 
   const passengerMap = useMemo(() => {
     const map = {};
@@ -387,45 +513,90 @@ export default function Driver() {
     return map;
   }, [passengers]);
 
-  const waitingCount = useMemo(() => passengers.filter((p) => p.active).length, [passengers]);
+  const waitingCount = useMemo(() => passengers.filter((p) => p.active && !p.accepted).length, [passengers]);
+
+  const topWaitingStops = useMemo(() => {
+    if (!stops?.length) return [];
+    const rows = stops
+      .map((s) => ({ stop: s, count: (passengerMap[s.id] || []).length }))
+      .filter((x) => x.count > 0)
+      .sort((a, b) => b.count - a.count);
+    return rows.slice(0, 3);
+  }, [stops, passengerMap]);
 
   const selectedStopPassengers = useMemo(() => {
     if (!selectedStop?.id) return [];
     return passengerMap[selectedStop.id] || [];
   }, [passengerMap, selectedStop]);
 
+  const acceptPassengerRow = async (p) => {
+    const code =
+      p.pickup_code && String(p.pickup_code).trim() ? String(p.pickup_code).trim() : genPickupCode();
+
+    const { data, error } = await supabase
+      .from("waiting_passengers")
+      .update({
+        accepted: true,
+        active: false,
+        driver_id: deviceId,
+        accepted_at: new Date().toISOString(),
+        pickup_code: code
+      })
+      .eq("id", p.id)
+      .eq("accepted", false)
+      .eq("active", true)
+      .select("id,pickup_code")
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!data?.id) return { ok: false, reason: "already_accepted" };
+
+    return { ok: true, pickup_code: data.pickup_code || code };
+  };
+
   const acknowledgePickup = async (p) => {
-    logEvent("passenger_seen", {
-      request_id: p.id,
-      destination_id: p.destination_id,
-      stop_id: p.stop_id
-    });
+    try {
+      logEvent("passenger_seen", {
+        request_id: p.id,
+        destination_id: p.destination_id,
+        stop_id: p.stop_id
+      });
 
-    logEvent("maps_opened", {
-      context: "navigate_to_passenger",
-      provider: "google_maps",
-      request_id: p.id,
-      destination_id: p.destination_id,
-      stop_id: p.stop_id
-    });
+      logEvent("maps_opened", {
+        context: "navigate_to_passenger",
+        provider: "google_maps",
+        request_id: p.id,
+        destination_id: p.destination_id,
+        stop_id: p.stop_id
+      });
 
-    openMap(p.lat, p.lng);
+      openMap(p.lat, p.lng);
 
-    logEvent("passenger_acknowledged", {
-      request_id: p.id,
-      destination_id: p.destination_id,
-      stop_id: p.stop_id,
-      route_id: ROUTE_ID
-    });
+      logEvent("passenger_acknowledged", {
+        request_id: p.id,
+        destination_id: p.destination_id,
+        stop_id: p.stop_id,
+        route_id: ROUTE_ID
+      });
 
-    await supabase.from("waiting_passengers").update({ active: false }).eq("id", p.id);
-    notify("success", "Passenger accepted ✅");
+      const res = await acceptPassengerRow(p);
+      if (!res.ok) {
+        notify("error", "This passenger was already accepted by another driver.", 4500);
+        return;
+      }
+
+      setTopPickupCode(res.pickup_code);
+      notify("success", `Passenger accepted ✅ Pickup code: ${res.pickup_code}`, 4500);
+    } catch (e) {
+      notify("error", "Failed to accept passenger: " + (e?.message || e), 5000);
+    }
   };
 
   const selectDestination = async (d) => {
     setSelectedDest(d);
     setSelectedStop(null);
     setTab("stops");
+    setTopPickupCode(null);
 
     logEvent("destination_selected", { destination_id: d.id });
 
@@ -517,9 +688,7 @@ export default function Driver() {
         const heartbeatMs = document.hidden ? HIDDEN_HEARTBEAT_MS : HEARTBEAT_MS;
         const dueByHeartbeat = now - last.t >= heartbeatMs;
 
-        // If hidden: avoid spam; only heartbeat
         if (document.hidden && !dueByHeartbeat) return;
-
         if (!dueByTime && !dueByMove && !dueByHeartbeat) return;
 
         await upsertDriversOnline(pos);
@@ -591,7 +760,7 @@ export default function Driver() {
     const onVis = () => {
       if (!isBroadcasting) return;
       if (!document.hidden) {
-        lastSentRef.current.t = 0; // force update next position
+        lastSentRef.current.t = 0;
         navigator.geolocation.getCurrentPosition(
           async (pos) => {
             try {
@@ -611,6 +780,7 @@ export default function Driver() {
 
     document.addEventListener("visibilitychange", onVis);
     return () => document.removeEventListener("visibilitychange", onVis);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isBroadcasting]);
 
   // Best-effort offline update on unload/pagehide
@@ -643,7 +813,7 @@ export default function Driver() {
     };
   }, [deviceId]);
 
-  // Component unmount cleanup (extra safety)
+  // Component unmount cleanup
   useEffect(() => {
     return () => {
       try {
@@ -667,6 +837,13 @@ export default function Driver() {
     await acknowledgePickup(selectedStopPassengers[0]);
   };
 
+  const passengerAgeLabel = useMemo(() => {
+    if (!passengerUpdatedAt) return "";
+    const s = Math.max(0, Math.floor((Date.now() - passengerUpdatedAt) / 1000));
+    if (s < 5) return "Updated just now";
+    return `Updated ${s}s ago`;
+  }, [passengerUpdatedAt, passengers]);
+
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100">
       <Toast toast={toast} onClose={() => setToast(null)} />
@@ -678,7 +855,10 @@ export default function Driver() {
             <div className="text-2xl">🚌</div>
             <div className="text-2xl font-black tracking-tight">Trotro</div>
           </div>
-          <div className="text-sm text-zinc-400">Pickup code ----</div>
+          <div className="text-sm text-zinc-400">
+            Pickup code{" "}
+            {topPickupCode ? <span className="text-amber-400 font-black">{topPickupCode}</span> : "----"}
+          </div>
         </div>
 
         {/* Hero graphic */}
@@ -697,7 +877,40 @@ export default function Driver() {
           </div>
         </div>
 
-        <div className="mt-2 text-zinc-400 text-lg">{waitingCount} waiting</div>
+        {/* BIG waiting banner */}
+        <div className="mt-2 rounded-3xl border border-white/10 bg-white/5 p-4">
+          <div className="flex items-end justify-between gap-3">
+            <div>
+              <div className="text-xs tracking-widest text-zinc-400">WAITING PASSENGERS</div>
+              <div className="mt-1 text-5xl font-black leading-none text-amber-400">{waitingCount}</div>
+              <div className="mt-1 text-sm text-zinc-400">
+                {waitingCount === 0 ? "No one waiting right now." : "Top stops are shown below."}
+              </div>
+              <div className="mt-1 text-xs text-zinc-500">{passengerAgeLabel}</div>
+            </div>
+            <div className="text-right text-xs text-zinc-500">
+              {selectedDest?.name ? `To: ${selectedDest.name}` : ""}
+            </div>
+          </div>
+
+          {waitingCount > 0 ? (
+            <div className="mt-3 rounded-2xl border border-amber-400/20 bg-amber-500/10 p-3">
+              <div className="text-xs tracking-widest text-amber-200/90">TOP STOPS</div>
+              <div className="mt-2 space-y-1">
+                {topWaitingStops.length === 0 ? (
+                  <div className="text-sm text-amber-100/80">Passengers are waiting, but stops haven’t loaded yet.</div>
+                ) : (
+                  topWaitingStops.map((x) => (
+                    <div key={x.stop.id} className="flex items-center justify-between">
+                      <div className="text-sm font-semibold text-amber-50">{x.stop.name}</div>
+                      <div className="text-sm font-black text-amber-300">{x.count}</div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          ) : null}
+        </div>
 
         {/* Destination card */}
         <div className="mt-5 rounded-3xl border border-white/10 bg-white/5 p-5">
@@ -706,14 +919,24 @@ export default function Driver() {
 
           <div className="mt-1 relative">
             <button onClick={() => setDestSheetOpen(true)} className="w-full text-left pr-10">
-              <div className="text-2xl font-black text-zinc-100">
-                {selectedDest?.name || "Select..."}
-              </div>
+              <div className="text-2xl font-black text-zinc-100">{selectedDest?.name || "Select..."}</div>
             </button>
             <div className="pointer-events-none absolute right-1 top-1/2 -translate-y-1/2 text-zinc-300">▾</div>
           </div>
 
           <div className="mt-3 h-[2px] w-full bg-amber-400/90 rounded-full" />
+
+          {/* Network slow / retry messages (destinations) */}
+          {destLoading ? <div className="mt-3 text-sm text-zinc-400">Loading destinations…</div> : null}
+          {!destLoading && destErr ? (
+            <button
+              onClick={refreshDestinations}
+              className="mt-3 w-full rounded-2xl border border-red-500/30 bg-red-500/10 p-3 text-left text-sm text-red-200"
+            >
+              Failed to load destinations. Tap to retry.
+              <div className="mt-1 text-xs text-red-300/80">{destErr}</div>
+            </button>
+          ) : null}
 
           <div className="mt-4 flex flex-wrap gap-2">
             <button
@@ -791,28 +1014,42 @@ export default function Driver() {
 
             <div className="mt-6">
               {tab === "stops" ? (
-                stops.length === 0 ? (
-                  <div className="text-zinc-500">No stops for this destination yet.</div>
-                ) : (
-                  <div className="space-y-5">
-                    {stops.map((s) => (
-                      <button
-                        key={s.id}
-                        onClick={() => {
-                          setSelectedStop(s);
-                          setTab("passengers");
-                          logEvent("stop_selected", { stop_id: s.id, destination_id: selectedDest.id });
-                        }}
-                        className="w-full text-left active:scale-[0.99]"
-                      >
-                        <div className="text-xl font-semibold text-zinc-100">{s.name}</div>
-                        <div className="text-sm text-zinc-500">
-                          Waiting: {(passengerMap[s.id] || []).length}
-                        </div>
-                      </button>
-                    ))}
-                  </div>
-                )
+                <div>
+                  {/* Network slow / retry messages (stops) */}
+                  {stopLoading ? <div className="text-zinc-400">Loading stops…</div> : null}
+                  {!stopLoading && stopErr ? (
+                    <button
+                      onClick={() => selectedDest?.id && refreshStops(selectedDest.id)}
+                      className="w-full rounded-2xl border border-red-500/30 bg-red-500/10 p-3 text-left text-sm text-red-200"
+                    >
+                      Failed to load stops. Tap to retry.
+                      <div className="mt-1 text-xs text-red-300/80">{stopErr}</div>
+                    </button>
+                  ) : null}
+
+                  {!stopLoading && !stopErr ? (
+                    stops.length === 0 ? (
+                      <div className="text-zinc-500">No stops for this destination yet.</div>
+                    ) : (
+                      <div className="space-y-5">
+                        {stops.map((s) => (
+                          <button
+                            key={s.id}
+                            onClick={() => {
+                              setSelectedStop(s);
+                              setTab("passengers");
+                              logEvent("stop_selected", { stop_id: s.id, destination_id: selectedDest.id });
+                            }}
+                            className="w-full text-left active:scale-[0.99]"
+                          >
+                            <div className="text-xl font-semibold text-zinc-100">{s.name}</div>
+                            <div className="text-sm text-zinc-500">Waiting: {(passengerMap[s.id] || []).length}</div>
+                          </button>
+                        ))}
+                      </div>
+                    )
+                  ) : null}
+                </div>
               ) : (
                 <div>
                   <div className="flex items-center justify-between">
@@ -863,7 +1100,10 @@ export default function Driver() {
         <div className="fixed bottom-0 left-0 right-0 bg-zinc-950/90 backdrop-blur border-t border-white/10">
           <div className="mx-auto max-w-md px-5 py-4 flex items-center gap-3">
             <button
-              onClick={acceptPassenger}
+              onClick={async () => {
+                if (!selectedStop || selectedStopPassengers.length === 0) return;
+                await acknowledgePickup(selectedStopPassengers[0]);
+              }}
               disabled={!selectedStop || selectedStopPassengers.length === 0}
               className={
                 "flex-1 rounded-3xl py-5 text-lg font-black tracking-wide active:scale-[0.99] " +

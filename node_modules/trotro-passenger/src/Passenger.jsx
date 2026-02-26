@@ -11,7 +11,7 @@ import {
 import { getToken, onMessage } from "firebase/messaging";
 import { isIOSDevice } from "@trotro/shared";
 
-/** Stable browser device id (like your Android device_id) */
+/** Stable passenger web device id */
 const getWebDeviceId = () => {
   const k = "trotro_web_device_id";
   const v = localStorage.getItem(k);
@@ -40,6 +40,39 @@ const isAndroidChrome = () => {
   const isChrome = /Chrome/i.test(ua) && !/Edg/i.test(ua) && !/OPR/i.test(ua);
   return isAndroid && isChrome;
 };
+
+/* ---------- Resilient fetch helpers ---------- */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function withRetry(
+  fn,
+  { tries = 4, baseDelayMs = 600, timeoutMs = 12000, onSlowNetwork } = {}
+) {
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= tries; attempt++) {
+    try {
+      const res = await Promise.race([
+        fn(),
+        (async () => {
+          await sleep(timeoutMs);
+          throw new Error("Request timed out");
+        })()
+      ]);
+      return res;
+    } catch (e) {
+      lastErr = e;
+      if (onSlowNetwork) onSlowNetwork(attempt, e?.message || String(e));
+      if (attempt === tries) break;
+
+      const jitter = Math.floor(Math.random() * 250);
+      const delay = baseDelayMs * Math.pow(2, attempt - 1) + jitter;
+      await sleep(delay);
+    }
+  }
+
+  throw lastErr || new Error("Request failed");
+}
 
 function Toast({ toast, onClose }) {
   if (!toast) return null;
@@ -86,7 +119,10 @@ function InstallSheet({ open, onClose }) {
             <ol className="mt-2 list-decimal pl-5 space-y-1 text-zinc-300">
               <li>Open this site in Chrome.</li>
               <li>Tap the menu ⋮ (top-right).</li>
-              <li>Tap <span className="text-zinc-100 font-semibold">Install app</span> or <span className="text-zinc-100 font-semibold">Add to Home screen</span>.</li>
+              <li>
+                Tap <span className="text-zinc-100 font-semibold">Install app</span> or{" "}
+                <span className="text-zinc-100 font-semibold">Add to Home screen</span>.
+              </li>
               <li>Open it from the new icon for the best experience.</li>
             </ol>
           </div>
@@ -95,12 +131,12 @@ function InstallSheet({ open, onClose }) {
             <div className="font-semibold text-zinc-100">iPhone (Safari)</div>
             <ol className="mt-2 list-decimal pl-5 space-y-1 text-zinc-300">
               <li>Open in Safari (not Chrome).</li>
-              <li>Tap Share → <span className="text-zinc-100 font-semibold">Add to Home Screen</span>.</li>
+              <li>
+                Tap Share → <span className="text-zinc-100 font-semibold">Add to Home Screen</span>.
+              </li>
               <li>Open from the icon to enable the best notification support.</li>
             </ol>
-            <div className="mt-2 text-zinc-400">
-              Video: {IOS_INSTALL_VIDEO}
-            </div>
+            <div className="mt-2 text-zinc-400">Video: {IOS_INSTALL_VIDEO}</div>
           </div>
         </div>
 
@@ -129,7 +165,9 @@ function DestinationSheet({ open, onClose, destinations, selectedId, onSelect })
       <div className="absolute left-0 right-0 bottom-0 mx-auto max-w-md rounded-t-3xl border border-white/10 bg-zinc-950 p-4">
         <div className="flex items-center justify-between">
           <div className="text-sm font-black tracking-wide text-zinc-100">Select destination</div>
-          <button onClick={onClose} className="text-zinc-400 hover:text-white">✕</button>
+          <button onClick={onClose} className="text-zinc-400 hover:text-white">
+            ✕
+          </button>
         </div>
 
         <div className="mt-3">
@@ -192,6 +230,15 @@ export default function Passenger() {
 
   const [pushEnabled, setPushEnabled] = useState(false);
 
+  // loading + errors (destinations/stops)
+  const [destLoading, setDestLoading] = useState(false);
+  const [stopLoading, setStopLoading] = useState(false);
+  const [destErr, setDestErr] = useState("");
+  const [stopErr, setStopErr] = useState("");
+
+  // pickup code shown after driver accepts
+  const [pickupCode, setPickupCode] = useState(null);
+
   // Drivers online
   const [driversOnlineRaw, setDriversOnlineRaw] = useState([]);
 
@@ -212,11 +259,6 @@ export default function Passenger() {
 
   // Request sent / cancel state
   const [requestState, setRequestState] = useState(null); // { id, createdAtMs, destinationName, stopName }
-  useEffect(() => {
-    if (!requestState) return;
-    const t = setTimeout(() => setRequestState(null), 30_000);
-    return () => clearTimeout(t);
-  }, [requestState]);
 
   const [lastRealtimeAt, setLastRealtimeAt] = useState(0);
   const [driversRefreshTick, setDriversRefreshTick] = useState(0);
@@ -251,7 +293,6 @@ export default function Passenger() {
 
       const standalone = isStandalonePWA();
 
-      // iOS requires install-from-home-screen for reliable push
       if (isIOS && !standalone) {
         notify(
           "info",
@@ -262,7 +303,6 @@ export default function Passenger() {
         return;
       }
 
-      // Android Chrome doesn’t strictly require install, but users benefit from it.
       if (isAndroidChrome() && !standalone) {
         notify("info", "Tip: Install this app on Android Chrome (⋮ → Install app) for a faster, app-like experience.", 6000);
       }
@@ -323,16 +363,35 @@ export default function Passenger() {
   };
 
   const refreshDestinations = async () => {
-    const { data, error } = await supabase.from("destinations").select("id,name").order("name");
-    if (error) return;
+    setDestErr("");
+    setDestLoading(true);
 
-    const list = data || [];
-    setDestinations(list);
+    try {
+      const list = await withRetry(
+        async () => {
+          const { data, error } = await supabase.from("destinations").select("id,name").order("name");
+          if (error) throw error;
+          return data || [];
+        },
+        {
+          tries: 4,
+          timeoutMs: 12000,
+          onSlowNetwork: (attempt) => notify("info", `Network seems slow… retrying destinations (${attempt}/4)`, 2200)
+        }
+      );
 
-    const saved = localStorage.getItem(DEFAULT_DEST_KEY);
-    if (saved && !selectedDest) {
-      const d = list.find((x) => x.id === saved);
-      if (d) loadStops(d);
+      setDestinations(list);
+
+      const saved = localStorage.getItem(DEFAULT_DEST_KEY);
+      if (saved && !selectedDest) {
+        const d = list.find((x) => x.id === saved);
+        if (d) loadStops(d);
+      }
+    } catch (e) {
+      setDestErr(e?.message || String(e));
+      notify("error", "Failed to load destinations. Tap to retry.", 5000);
+    } finally {
+      setDestLoading(false);
     }
   };
 
@@ -347,6 +406,9 @@ export default function Passenger() {
     setLocationHelp("");
     setGpsStatus("");
     setTab("stops");
+    setStopErr("");
+    setStopLoading(true);
+    setPickupCode(null);
 
     logEvent("destination_selected", { destination_id: dest.id });
 
@@ -361,14 +423,33 @@ export default function Passenger() {
       { onConflict: "device_id,app" }
     );
 
-    const { data, error } = await supabase
-      .from("route_stops")
-      .select("id,name,stop_order")
-      .eq("destination_id", dest.id)
-      .eq("route_id", ROUTE_ID)
-      .order("stop_order");
+    try {
+      const rows = await withRetry(
+        async () => {
+          const { data, error } = await supabase
+            .from("route_stops")
+            .select("id,name,stop_order")
+            .eq("destination_id", dest.id)
+            .eq("route_id", ROUTE_ID)
+            .order("stop_order");
 
-    if (!error) setStops(data || []);
+          if (error) throw error;
+          return data || [];
+        },
+        {
+          tries: 4,
+          timeoutMs: 12000,
+          onSlowNetwork: (attempt) => notify("info", `Network seems slow… retrying stops (${attempt}/4)`, 2200)
+        }
+      );
+
+      setStops(rows);
+    } catch (e) {
+      setStopErr(e?.message || String(e));
+      notify("error", "Failed to load stops. Tap to retry.", 5000);
+    } finally {
+      setStopLoading(false);
+    }
   };
 
   const isUnknownStopSelected = useMemo(() => {
@@ -394,14 +475,15 @@ export default function Passenger() {
     const expiresIso = new Date(now + 5 * 60 * 1000).toISOString();
 
     try {
-      // Reuse existing active request for this device if present
+      // Reuse existing active request for this device if present (and not accepted)
       const { data: existing, error: existingErr } = await supabase
         .from("waiting_passengers")
-        .select("id,expires_at,active")
+        .select("id,expires_at,active,accepted,pickup_code")
         .eq("route_id", ROUTE_ID)
         .eq("destination_id", selectedDest.id)
         .eq("device_id", deviceId)
         .eq("active", true)
+        .eq("accepted", false)
         .gt("expires_at", nowIso)
         .order("created_at", { ascending: false })
         .limit(1)
@@ -419,9 +501,13 @@ export default function Passenger() {
             stop_id: selectedStop.id,
             destination_id: selectedDest.id,
             route_id: ROUTE_ID,
+            destination: selectedDest?.name || null,
             lat,
             lng,
             active: true,
+            accepted: false,
+            driver_id: null,
+            pickup_code: null,
             last_seen: nowIso,
             expires_at: expiresIso
           })
@@ -431,7 +517,6 @@ export default function Passenger() {
         if (error) throw error;
         requestId = data?.id ?? null;
       } else {
-        // Refresh last_seen so the driver side sees it as fresh
         await supabase.from("waiting_passengers").update({ last_seen: nowIso }).eq("id", requestId);
       }
 
@@ -469,6 +554,7 @@ export default function Passenger() {
       if (error) throw error;
       logEvent("pickup_cancelled", { request_id: requestState.id });
       setRequestState(null);
+      setPickupCode(null);
       notify("success", "Cancelled ✅");
     } catch (e) {
       notify("error", "Failed to cancel: " + (e?.message || e), 5000);
@@ -533,6 +619,90 @@ export default function Passenger() {
       }
     );
   };
+
+  /* ===== After request is sent: realtime + POLL fallback for pickup_code ===== */
+  useEffect(() => {
+    if (!requestState?.id) {
+      setPickupCode(null);
+      return;
+    }
+
+    let alive = true;
+    let pollTimer = null;
+
+    const fetchCode = async () => {
+      const { data, error } = await supabase
+        .from("waiting_passengers")
+        .select("pickup_code,accepted,active")
+        .eq("id", requestState.id)
+        .maybeSingle();
+
+      if (!alive) return;
+
+      if (error) {
+        // If RLS blocks select, you'll see it here.
+        console.warn("pickup_code fetch error:", error);
+        return;
+      }
+
+      const code = data?.pickup_code ? String(data.pickup_code).trim() : null;
+
+      if (code) {
+        setPickupCode(code);
+
+        // stop polling once we have it
+        if (pollTimer) {
+          clearInterval(pollTimer);
+          pollTimer = null;
+        }
+      }
+    };
+
+    // debug: see which row we are watching
+    console.log("Watching request for pickup_code:", requestState.id);
+
+    // 1) fetch immediately
+    fetchCode();
+
+    // 2) subscribe for updates
+    const channel = supabase
+      .channel("waiting_passenger_single_row_passenger_web")
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "waiting_passengers", filter: `id=eq.${requestState.id}` },
+        () => fetchCode()
+      )
+      .subscribe((status) => {
+        console.log("realtime status:", status);
+      });
+
+    // 3) poll fallback: every 2s for 40s
+    let tries = 0;
+    pollTimer = setInterval(() => {
+      tries++;
+      fetchCode();
+      if (tries >= 20) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    }, 2000);
+
+    return () => {
+      alive = false;
+      if (pollTimer) clearInterval(pollTimer);
+      supabase.removeChannel(channel);
+    };
+  }, [requestState?.id]);
+
+  /* Keep request visible longer (don’t auto-clear at 30s) */
+  useEffect(() => {
+    if (!requestState) return;
+    if (pickupCode) return;
+    const t = setTimeout(() => {
+      setRequestState((cur) => cur);
+    }, 2 * 60 * 1000);
+    return () => clearTimeout(t);
+  }, [requestState, pickupCode]);
 
   /* ===== LIVE DRIVERS ONLINE (drivers_online) ===== */
   useEffect(() => {
@@ -634,13 +804,24 @@ export default function Passenger() {
 
         <div className="mt-2 text-zinc-400 text-lg">Waiting for driver...</div>
 
-        {/* Request Sent Card */}
+        {/* Request Sent Card + pickup code */}
         {requestState ? (
           <div className="mt-4 rounded-3xl border border-emerald-400/20 bg-emerald-500/10 p-4">
             <div className="text-sm font-semibold text-emerald-100">Request sent ✅</div>
             <div className="mt-1 text-sm text-emerald-100/80">
               {requestState.stopName} → {requestState.destinationName}
             </div>
+
+            {pickupCode ? (
+              <div className="mt-3 rounded-2xl border border-amber-400/20 bg-amber-500/10 p-3">
+                <div className="text-xs tracking-widest text-amber-100/80">PICKUP CODE</div>
+                <div className="mt-1 text-4xl font-black text-amber-300">{pickupCode}</div>
+                <div className="mt-1 text-sm text-amber-100/80">Show this code to the driver.</div>
+              </div>
+            ) : (
+              <div className="mt-3 text-sm text-emerald-100/70">Waiting for driver to accept…</div>
+            )}
+
             <button
               onClick={cancelRequest}
               className="mt-3 rounded-2xl border border-white/10 bg-white/5 px-4 py-2 text-sm font-semibold hover:bg-white/10"
@@ -657,16 +838,24 @@ export default function Passenger() {
 
           <div className="mt-1 relative">
             <button onClick={() => setDestSheetOpen(true)} className="w-full text-left pr-10">
-              <div className="text-2xl font-black text-zinc-100">
-                {selectedDest?.name || "Select..."}
-              </div>
+              <div className="text-2xl font-black text-zinc-100">{selectedDest?.name || "Select..."}</div>
             </button>
-            <div className="pointer-events-none absolute right-1 top-1/2 -translate-y-1/2 text-zinc-300">
-              ▾
-            </div>
+            <div className="pointer-events-none absolute right-1 top-1/2 -translate-y-1/2 text-zinc-300">▾</div>
           </div>
 
           <div className="mt-3 h-[2px] w-full bg-amber-400/90 rounded-full" />
+
+          {/* Network slow / retry messages (destinations) */}
+          {destLoading ? <div className="mt-3 text-sm text-zinc-400">Loading destinations…</div> : null}
+          {!destLoading && destErr ? (
+            <button
+              onClick={refreshDestinations}
+              className="mt-3 w-full rounded-2xl border border-red-500/30 bg-red-500/10 p-3 text-left text-sm text-red-200"
+            >
+              Failed to load destinations. Tap to retry.
+              <div className="mt-1 text-xs text-red-300/80">{destErr}</div>
+            </button>
+          ) : null}
 
           <div className="mt-4 flex flex-wrap gap-2">
             <button
@@ -728,41 +917,56 @@ export default function Passenger() {
 
             <div className="mt-6">
               {tab === "stops" ? (
-                stops.length === 0 ? (
-                  <div className="text-zinc-500">No stops for this destination yet.</div>
-                ) : (
-                  <div className="space-y-5">
-                    {stops.map((s) => {
-                      const lower = (s.name || "").trim().toLowerCase();
-                      const isUnknown =
-                        lower.includes("don't know my stop") ||
-                        lower.includes("dont know my stop") ||
-                        lower.includes("don\u2019t know my stop");
+                <div>
+                  {stopLoading ? <div className="text-zinc-400">Loading stops…</div> : null}
+                  {!stopLoading && stopErr ? (
+                    <button
+                      onClick={() => selectedDest && loadStops(selectedDest)}
+                      className="w-full rounded-2xl border border-red-500/30 bg-red-500/10 p-3 text-left text-sm text-red-200"
+                    >
+                      Failed to load stops. Tap to retry.
+                      <div className="mt-1 text-xs text-red-300/80">{stopErr}</div>
+                    </button>
+                  ) : null}
 
-                      return (
-                        <button
-                          key={s.id}
-                          onClick={() => {
-                            setSelectedStop(s);
-                            setLocationHelp("");
-                            setGpsStatus("");
-                            logEvent("stop_selected", { stop_id: s.id, destination_id: selectedDest.id });
-                          }}
-                          className="w-full text-left active:scale-[0.99]"
-                        >
-                          <div className="text-xl font-semibold text-zinc-100">{s.name}</div>
-                          <div className="text-sm text-zinc-500">
-                            {selectedStop?.id === s.id
-                              ? "Selected ✅"
-                              : isUnknown
-                              ? "Uses your GPS to help the driver find you."
-                              : "Tap to select"}
-                          </div>
-                        </button>
-                      );
-                    })}
-                  </div>
-                )
+                  {!stopLoading && !stopErr ? (
+                    stops.length === 0 ? (
+                      <div className="text-zinc-500">No stops for this destination yet.</div>
+                    ) : (
+                      <div className="space-y-5">
+                        {stops.map((s) => {
+                          const lower = (s.name || "").trim().toLowerCase();
+                          const isUnknown =
+                            lower.includes("don't know my stop") ||
+                            lower.includes("dont know my stop") ||
+                            lower.includes("don\u2019t know my stop");
+
+                          return (
+                            <button
+                              key={s.id}
+                              onClick={() => {
+                                setSelectedStop(s);
+                                setLocationHelp("");
+                                setGpsStatus("");
+                                logEvent("stop_selected", { stop_id: s.id, destination_id: selectedDest.id });
+                              }}
+                              className="w-full text-left active:scale-[0.99]"
+                            >
+                              <div className="text-xl font-semibold text-zinc-100">{s.name}</div>
+                              <div className="text-sm text-zinc-500">
+                                {selectedStop?.id === s.id
+                                  ? "Selected ✅"
+                                  : isUnknown
+                                  ? "Uses your GPS to help the driver find you."
+                                  : "Tap to select"}
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )
+                  ) : null}
+                </div>
               ) : (
                 <div>
                   <div className="flex items-center justify-between">
@@ -782,12 +986,8 @@ export default function Passenger() {
                     {driversOnline.length === 0 ? (
                       <div className="text-zinc-500">
                         🚗 No driver nearby
-                        <div className="text-zinc-600 text-sm mt-1">
-                          Drivers appear here when they broadcast.
-                        </div>
-                        <div className="text-zinc-600 text-sm mt-1">
-                          If drivers are indoors GPS may delay updates.
-                        </div>
+                        <div className="text-zinc-600 text-sm mt-1">Drivers appear here when they broadcast.</div>
+                        <div className="text-zinc-600 text-sm mt-1">If drivers are indoors GPS may delay updates.</div>
                       </div>
                     ) : (
                       <div className="space-y-5">
@@ -813,9 +1013,7 @@ export default function Passenger() {
                               }}
                               className="w-full text-left active:scale-[0.99]"
                             >
-                              <div className="text-xl font-semibold text-zinc-100">
-                                🚗 Driver {idx + 1} nearby
-                              </div>
+                              <div className="text-xl font-semibold text-zinc-100">🚗 Driver {idx + 1} nearby</div>
                               <div className="text-sm text-zinc-500">
                                 Tap to open in Maps
                                 {ageSec != null ? ` • Updated ${ageSec}s ago` : ""}
