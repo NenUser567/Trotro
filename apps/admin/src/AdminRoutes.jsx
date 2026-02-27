@@ -1,8 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { supabase, ROUTE_ID, ADMIN_API_BASE } from "./supabaseClient";
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 function parseBulkLines(text) {
   return (text || "")
     .split(/\r?\n/)
@@ -15,10 +13,12 @@ async function adminFetch(path, { token, method = "GET", body } = {}) {
     method,
     headers: {
       "content-type": "application/json",
-      "x-admin-token": token || "",
+      // only if your worker checks it. harmless if not used.
+      "x-admin-token": token || ""
     },
-    body: body ? JSON.stringify(body) : undefined,
+    body: body ? JSON.stringify(body) : undefined
   });
+
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data?.error || `Request failed (${res.status})`);
   return data;
@@ -31,7 +31,9 @@ function Toast({ msg, onClose }) {
       <div className="rounded-2xl border border-white/10 bg-zinc-950/90 p-3 text-sm text-zinc-100 backdrop-blur">
         <div className="flex items-start justify-between gap-3">
           <div className="whitespace-pre-wrap">{msg}</div>
-          <button className="text-zinc-400 hover:text-white" onClick={onClose}>✕</button>
+          <button className="text-zinc-400 hover:text-white" onClick={onClose}>
+            ✕
+          </button>
         </div>
       </div>
     </div>
@@ -74,7 +76,7 @@ export default function AdminRoutes() {
     sessionStorage.setItem("admin_token", token);
   }, [token]);
 
-  // ---------- LOAD DESTINATIONS ----------
+  // ---------- LOAD DESTINATIONS (read direct from Supabase) ----------
   const loadDestinations = async () => {
     const { data, error } = await supabase.from("destinations").select("id,name").order("name");
     if (error) throw error;
@@ -82,7 +84,7 @@ export default function AdminRoutes() {
     if (!selectedDestId && data?.[0]?.id) setSelectedDestId(data[0].id);
   };
 
-  // ---------- LOAD STOPS ----------
+  // ---------- LOAD STOPS (read direct from Supabase) ----------
   const loadStops = async (destId) => {
     if (!destId) {
       setStops([]);
@@ -122,13 +124,11 @@ export default function AdminRoutes() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedDestId]);
 
-  // ---------- REALTIME SUBSCRIPTIONS ----------
+  // ---------- REALTIME SUBSCRIPTIONS (read direct from Supabase) ----------
   useEffect(() => {
-    // destinations realtime
     const ch1 = supabase
       .channel("admin_destinations_realtime")
       .on("postgres_changes", { event: "*", schema: "public", table: "destinations" }, () => {
-        // reload list (light table)
         loadDestinations().catch(() => {});
       })
       .subscribe();
@@ -150,10 +150,9 @@ export default function AdminRoutes() {
           event: "*",
           schema: "public",
           table: "route_stops",
-          filter: `destination_id=eq.${selectedDestId}`,
+          filter: `destination_id=eq.${selectedDestId}`
         },
         () => {
-          // preserve scrollTop if user is in the list
           const el = stopsListRef.current;
           const prevTop = el ? el.scrollTop : null;
 
@@ -172,17 +171,17 @@ export default function AdminRoutes() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedDestId]);
 
-  // ---------- DESTINATIONS CRUD ----------
+  // ---------- DESTINATIONS CRUD (write via Worker) ----------
   const createDestination = async () => {
     const name = newDestName.trim();
     if (!name) return;
 
     setLoading(true);
     try {
-      await adminFetch("/destinations", {
+      await adminFetch("/api/destinations", {
         token,
         method: "POST",
-        body: { name },
+        body: { name }
       });
       setNewDestName("");
       notify("Destination added ✅");
@@ -193,19 +192,21 @@ export default function AdminRoutes() {
     }
   };
 
+  // Worker DOES NOT support bulk destinations yet.
+  // Keep UI but do it by calling POST repeatedly.
   const bulkCreateDestinations = async () => {
     const names = parseBulkLines(bulkDestText);
     if (!names.length) return;
 
     setLoading(true);
     try {
-      await adminFetch("/destinations", {
-        token,
-        method: "POST",
-        body: { names },
-      });
+      let ok = 0;
+      for (const n of names) {
+        await adminFetch("/api/destinations", { token, method: "POST", body: { name: n } });
+        ok++;
+      }
       setBulkDestText("");
-      notify(`Added ${names.length} destination(s) ✅`);
+      notify(`Added ${ok} destination(s) ✅`);
     } catch (e) {
       notify("Bulk add failed: " + (e?.message || e));
     } finally {
@@ -220,10 +221,10 @@ export default function AdminRoutes() {
 
     setLoading(true);
     try {
-      await adminFetch("/destinations", {
+      await adminFetch(`/api/destinations/${id}`, {
         token,
         method: "PATCH",
-        body: { id, name: name.trim() },
+        body: { name: name.trim() }
       });
       notify("Destination renamed ✅");
     } catch (e) {
@@ -234,18 +235,12 @@ export default function AdminRoutes() {
   };
 
   const deleteDestination = async (id) => {
-    const cascade = confirm(
-      "Delete destination?\n\nOK = also delete all stops for this destination.\nCancel = do nothing."
-    );
+    const cascade = confirm("Delete destination?\n\nThis will also delete all stops for this destination.");
     if (!cascade) return;
 
     setLoading(true);
     try {
-      await adminFetch("/destinations", {
-        token,
-        method: "DELETE",
-        body: { id, cascade: true },
-      });
+      await adminFetch(`/api/destinations/${id}`, { token, method: "DELETE" });
       if (selectedDestId === id) setSelectedDestId("");
       notify("Destination deleted ✅");
     } catch (e) {
@@ -255,12 +250,14 @@ export default function AdminRoutes() {
     }
   };
 
-  // ---------- STOPS CRUD ----------
+  // ---------- STOPS CRUD (write via Worker) ----------
   const nextStopOrder = useMemo(() => {
     if (!stops.length) return 1;
     return Math.max(...stops.map((s) => s.stop_order || 0)) + 1;
   }, [stops]);
 
+  // Worker currently supports bulk insert via /api/stops/bulk.
+  // For single stop, we call bulk with one line.
   const createStop = async () => {
     if (!selectedDestId) return;
     const name = newStopName.trim();
@@ -268,15 +265,13 @@ export default function AdminRoutes() {
 
     setLoading(true);
     try {
-      await adminFetch("/stops", {
+      await adminFetch("/api/stops/bulk", {
         token,
         method: "POST",
         body: {
-          route_id: ROUTE_ID,
           destination_id: selectedDestId,
-          name,
-          start_order: nextStopOrder,
-        },
+          namesText: name
+        }
       });
       setNewStopName("");
       notify("Stop added ✅");
@@ -294,15 +289,13 @@ export default function AdminRoutes() {
 
     setLoading(true);
     try {
-      await adminFetch("/stops", {
+      await adminFetch("/api/stops/bulk", {
         token,
         method: "POST",
         body: {
-          route_id: ROUTE_ID,
           destination_id: selectedDestId,
-          names,
-          start_order: nextStopOrder,
-        },
+          namesText: names.join("\n")
+        }
       });
       setBulkStopText("");
       notify(`Added ${names.length} stop(s) ✅`);
@@ -313,6 +306,9 @@ export default function AdminRoutes() {
     }
   };
 
+  // Worker DOES NOT have stop rename/delete endpoints in the code you pasted.
+  // So these two must write directly to Supabase (safe if your current RLS allows it),
+  // OR you add endpoints later. For now, we do direct Supabase write to avoid breaking you.
   const renameStop = async (id) => {
     const cur = stops.find((s) => s.id === id);
     const name = prompt("Rename stop:", cur?.name || "");
@@ -320,11 +316,8 @@ export default function AdminRoutes() {
 
     setLoading(true);
     try {
-      await adminFetch("/stops", {
-        token,
-        method: "PATCH",
-        body: { id, name: name.trim() },
-      });
+      const { error } = await supabase.from("route_stops").update({ name: name.trim() }).eq("id", id);
+      if (error) throw error;
       notify("Stop renamed ✅");
     } catch (e) {
       notify("Rename stop failed: " + (e?.message || e));
@@ -338,11 +331,8 @@ export default function AdminRoutes() {
 
     setLoading(true);
     try {
-      await adminFetch("/stops", {
-        token,
-        method: "DELETE",
-        body: { id },
-      });
+      const { error } = await supabase.from("route_stops").delete().eq("id", id);
+      if (error) throw error;
       notify("Stop deleted ✅");
     } catch (e) {
       notify("Delete stop failed: " + (e?.message || e));
@@ -351,7 +341,7 @@ export default function AdminRoutes() {
     }
   };
 
-  // ---------- REORDER ----------
+  // ---------- REORDER (write via Worker) ----------
   const moveStop = (id, dir) => {
     const idx = stops.findIndex((s) => s.id === id);
     if (idx < 0) return;
@@ -364,7 +354,6 @@ export default function AdminRoutes() {
     copy[idx] = copy[j];
     copy[j] = tmp;
 
-    // normalize orders visually (1..n) but don’t save yet
     const normalized = copy.map((s, k) => ({ ...s, stop_order: k + 1 }));
     setStops(normalized);
   };
@@ -374,11 +363,11 @@ export default function AdminRoutes() {
 
     setLoading(true);
     try {
-      const items = stops.map((s, idx) => ({ id: s.id, stop_order: idx + 1 }));
-      await adminFetch("/stops/reorder", {
+      const ordered_ids = stops.map((s) => s.id); // current UI order is the intended new order
+      await adminFetch("/api/stops/reorder", {
         token,
-        method: "PUT",
-        body: { items },
+        method: "POST",
+        body: { ordered_ids }
       });
       notify("Order saved ✅");
     } catch (e) {
@@ -397,9 +386,7 @@ export default function AdminRoutes() {
         <div className="flex items-start justify-between gap-4">
           <div>
             <div className="text-2xl font-black">Trotro Admin</div>
-            <div className="text-sm text-zinc-400 mt-1">
-              Realtime destinations + stops • Writes go through Worker
-            </div>
+            <div className="text-sm text-zinc-400 mt-1">Realtime destinations + stops</div>
           </div>
 
           <div className="w-full max-w-md rounded-2xl border border-white/10 bg-white/5 p-3">
@@ -411,13 +398,13 @@ export default function AdminRoutes() {
               className="mt-2 w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none"
             />
             <div className="mt-2 text-xs text-zinc-500">
-              This token is not shipped in the build. It’s stored in sessionStorage.
+              Stored in sessionStorage. (If your Worker isn’t enforcing it yet, you can ignore this field.)
             </div>
           </div>
         </div>
 
-        {/* Destinations */}
         <div className="mt-6 grid grid-cols-1 gap-5 lg:grid-cols-2">
+          {/* Destinations */}
           <div className="rounded-3xl border border-white/10 bg-white/5 p-5">
             <div className="text-xs tracking-widest text-zinc-400">DESTINATIONS</div>
 
@@ -451,6 +438,9 @@ export default function AdminRoutes() {
               >
                 Bulk add destinations
               </button>
+              <div className="mt-2 text-xs text-zinc-500">
+                Note: worker doesn’t have a true bulk endpoint for destinations yet — this loops POST calls.
+              </div>
             </div>
 
             <div className="mt-5">
@@ -603,7 +593,6 @@ export default function AdminRoutes() {
           </div>
         </div>
 
-        {/* Footer sanity */}
         <div className="mt-8 text-xs text-zinc-500">
           ROUTE_ID: <span className="text-zinc-300">{ROUTE_ID || "(missing VITE_ROUTE_ID)"}</span>
           <br />
