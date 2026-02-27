@@ -18,12 +18,12 @@ const corsHeaders = (req: Request, env: Env) => {
     .map((s) => s.trim())
     .filter(Boolean);
 
-  // dev default: allow all
   const allowOrigin = allowed.length ? (allowed.includes(origin) ? origin : allowed[0]) : "*";
 
   return {
     "Access-Control-Allow-Origin": allowOrigin,
     "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
+    // IMPORTANT: allow x-admin-token so browser doesn't block your requests
     "Access-Control-Allow-Headers": "content-type, x-admin-token, authorization",
     "Access-Control-Max-Age": "86400"
   } as Record<string, string>;
@@ -69,6 +69,15 @@ const cleanLines = (text: string) =>
     .map((s) => s.trim())
     .filter(Boolean);
 
+async function destinationExists(env: Env, destinationId: string) {
+  const rows = await supabaseFetch(
+    env,
+    `/rest/v1/destinations?select=id&id=eq.${encodeURIComponent(destinationId)}&limit=1`,
+    { method: "GET" }
+  );
+  return Array.isArray(rows) && rows.length > 0;
+}
+
 export default {
   async fetch(req: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
@@ -76,17 +85,14 @@ export default {
     // Preflight
     if (req.method === "OPTIONS") return withCors(req, env, new Response(null, { status: 204 }));
 
-    // IMPORTANT: this Worker is API-only.
-    // Root path returns health JSON to avoid asset/SPA issues.
+    // Root => health
     if (url.pathname === "/" || url.pathname === "") {
       return withCors(req, env, json({ ok: true }));
     }
 
     // API lives under /api/*
     const isApi = url.pathname === "/api" || url.pathname.startsWith("/api/");
-    if (!isApi) {
-      return withCors(req, env, json({ error: "Not found" }, 404));
-    }
+    if (!isApi) return withCors(req, env, json({ error: "Not found" }, 404));
 
     try {
       const path = url.pathname.replace(/^\/api/, "") || "/";
@@ -96,6 +102,8 @@ export default {
       if (req.method === "GET" && (path === "/" || path === "/health")) {
         return withCors(req, env, json({ ok: true }));
       }
+
+      /* ===================== DESTINATIONS ===================== */
 
       // POST /api/destinations { name }
       if (parts[0] === "destinations" && parts.length === 1 && req.method === "POST") {
@@ -108,6 +116,7 @@ export default {
           headers: { Prefer: "return=representation" },
           body: JSON.stringify({ name })
         });
+
         return withCors(req, env, json({ ok: true, data }));
       }
 
@@ -126,6 +135,10 @@ export default {
             headers: { Prefer: "return=representation" },
             body: JSON.stringify({ name })
           });
+
+          const updatedCount = Array.isArray(data) ? data.length : 0;
+          if (updatedCount === 0) return withCors(req, env, json({ error: "Destination not found" }, 404));
+
           return withCors(req, env, json({ ok: true, data }));
         }
 
@@ -139,8 +152,86 @@ export default {
             method: "DELETE",
             headers: { Prefer: "return=representation" }
           });
+
+          const deletedCount = Array.isArray(data) ? data.length : 0;
+          if (deletedCount === 0) return withCors(req, env, json({ error: "Destination not found" }, 404));
+
           return withCors(req, env, json({ ok: true, data }));
         }
+      }
+
+      /* ===================== STOPS ===================== */
+
+      // POST /api/stops { destination_id, name }
+      if (parts[0] === "stops" && parts.length === 1 && req.method === "POST") {
+        const body = await req.json<any>();
+        const destination_id = String(body?.destination_id || "");
+        const name = String(body?.name || "").trim();
+        if (!destination_id || !name) {
+          return withCors(req, env, json({ error: "destination_id + name required" }, 400));
+        }
+
+        if (!(await destinationExists(env, destination_id))) {
+          return withCors(req, env, json({ error: "destination_id not found in destinations" }, 400));
+        }
+
+        const maxRow = await supabaseFetch(
+          env,
+          `/rest/v1/route_stops?select=stop_order&route_id=eq.${env.ROUTE_ID}&destination_id=eq.${encodeURIComponent(
+            destination_id
+          )}&order=stop_order.desc&limit=1`,
+          { method: "GET" }
+        );
+
+        const max =
+          Array.isArray(maxRow) && maxRow[0]?.stop_order != null ? Number(maxRow[0].stop_order) : 0;
+
+        const data = await supabaseFetch(env, "/rest/v1/route_stops", {
+          method: "POST",
+          headers: { Prefer: "return=representation" },
+          body: JSON.stringify({
+            route_id: env.ROUTE_ID,
+            destination_id,
+            name,
+            stop_order: max + 1
+          })
+        });
+
+        return withCors(req, env, json({ ok: true, data }));
+      }
+
+      // PATCH /api/stops/:id { name }
+      if (parts[0] === "stops" && parts.length === 2 && req.method === "PATCH") {
+        const stopId = parts[1];
+        const body = await req.json<any>();
+        const name = String(body?.name || "").trim();
+        if (!name) return withCors(req, env, json({ error: "name required" }, 400));
+
+        const data = await supabaseFetch(env, `/rest/v1/route_stops?id=eq.${encodeURIComponent(stopId)}`, {
+          method: "PATCH",
+          headers: { Prefer: "return=representation" },
+          body: JSON.stringify({ name })
+        });
+
+        const updatedCount = Array.isArray(data) ? data.length : 0;
+        if (updatedCount === 0) return withCors(req, env, json({ error: "Stop not found" }, 404));
+
+        return withCors(req, env, json({ ok: true, data }));
+      }
+
+      // DELETE /api/stops/:id
+      if (parts[0] === "stops" && parts.length === 2 && req.method === "DELETE") {
+        const stopId = parts[1];
+
+        const data = await supabaseFetch(env, `/rest/v1/route_stops?id=eq.${encodeURIComponent(stopId)}`, {
+          method: "DELETE",
+          headers: { Prefer: "return=representation" }
+        });
+
+        const deletedCount = Array.isArray(data) ? data.length : 0;
+        if (deletedCount === 0) return withCors(req, env, json({ error: "Stop not found" }, 404));
+
+        return withCors(req, env, json({ ok: true, data }));
       }
 
       // POST /api/stops/bulk { destination_id, namesText }
@@ -153,7 +244,10 @@ export default {
           return withCors(req, env, json({ error: "destination_id + namesText required" }, 400));
         }
 
-        // find current max stop_order
+        if (!(await destinationExists(env, destination_id))) {
+          return withCors(req, env, json({ error: "destination_id not found in destinations" }, 400));
+        }
+
         const maxRow = await supabaseFetch(
           env,
           `/rest/v1/route_stops?select=stop_order&route_id=eq.${env.ROUTE_ID}&destination_id=eq.${encodeURIComponent(
@@ -162,7 +256,8 @@ export default {
           { method: "GET" }
         );
 
-        const max = Array.isArray(maxRow) && maxRow[0]?.stop_order ? Number(maxRow[0].stop_order) : 0;
+        const max =
+          Array.isArray(maxRow) && maxRow[0]?.stop_order != null ? Number(maxRow[0].stop_order) : 0;
 
         const rows = names.map((name, i) => ({
           route_id: env.ROUTE_ID,
@@ -177,7 +272,7 @@ export default {
           body: JSON.stringify(rows)
         });
 
-        return withCors(req, env, json({ ok: true, inserted: data?.length || 0, data }));
+        return withCors(req, env, json({ ok: true, inserted: Array.isArray(data) ? data.length : 0, data }));
       }
 
       // POST /api/stops/reorder { ordered_ids: [] }
@@ -186,8 +281,7 @@ export default {
         const ordered_ids: string[] = Array.isArray(body?.ordered_ids) ? body.ordered_ids : [];
         if (!ordered_ids.length) return withCors(req, env, json({ error: "ordered_ids required" }, 400));
 
-        // NOTE: This keeps your existing behavior (simple loop).
-        // If you want it faster later, we can switch to an RPC.
+        // update stop_order sequentially
         for (let i = 0; i < ordered_ids.length; i++) {
           await supabaseFetch(env, `/rest/v1/route_stops?id=eq.${encodeURIComponent(ordered_ids[i])}`, {
             method: "PATCH",

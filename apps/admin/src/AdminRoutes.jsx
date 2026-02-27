@@ -13,7 +13,6 @@ async function adminFetch(path, { token, method = "GET", body } = {}) {
     method,
     headers: {
       "content-type": "application/json",
-      // only if your worker checks it. harmless if not used.
       "x-admin-token": token || ""
     },
     body: body ? JSON.stringify(body) : undefined
@@ -76,7 +75,7 @@ export default function AdminRoutes() {
     sessionStorage.setItem("admin_token", token);
   }, [token]);
 
-  // ---------- LOAD DESTINATIONS (read direct from Supabase) ----------
+  // ---------- READ: DESTINATIONS ----------
   const loadDestinations = async () => {
     const { data, error } = await supabase.from("destinations").select("id,name").order("name");
     if (error) throw error;
@@ -84,7 +83,7 @@ export default function AdminRoutes() {
     if (!selectedDestId && data?.[0]?.id) setSelectedDestId(data[0].id);
   };
 
-  // ---------- LOAD STOPS (read direct from Supabase) ----------
+  // ---------- READ: STOPS ----------
   const loadStops = async (destId) => {
     if (!destId) {
       setStops([]);
@@ -102,29 +101,17 @@ export default function AdminRoutes() {
 
   // initial load
   useEffect(() => {
-    (async () => {
-      try {
-        await loadDestinations();
-      } catch (e) {
-        notify("Failed to load destinations: " + (e?.message || e));
-      }
-    })();
+    loadDestinations().catch((e) => notify("Failed to load destinations: " + (e?.message || e)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // load stops when destination changes
   useEffect(() => {
-    (async () => {
-      try {
-        await loadStops(selectedDestId);
-      } catch (e) {
-        notify("Failed to load stops: " + (e?.message || e));
-      }
-    })();
+    loadStops(selectedDestId).catch((e) => notify("Failed to load stops: " + (e?.message || e)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedDestId]);
 
-  // ---------- REALTIME SUBSCRIPTIONS (read direct from Supabase) ----------
+  // ---------- REALTIME (READ DIRECT) ----------
   useEffect(() => {
     const ch1 = supabase
       .channel("admin_destinations_realtime")
@@ -146,12 +133,7 @@ export default function AdminRoutes() {
       .channel("admin_stops_realtime_" + selectedDestId)
       .on(
         "postgres_changes",
-        {
-          event: "*",
-          schema: "public",
-          table: "route_stops",
-          filter: `destination_id=eq.${selectedDestId}`
-        },
+        { event: "*", schema: "public", table: "route_stops", filter: `destination_id=eq.${selectedDestId}` },
         () => {
           const el = stopsListRef.current;
           const prevTop = el ? el.scrollTop : null;
@@ -171,18 +153,15 @@ export default function AdminRoutes() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedDestId]);
 
-  // ---------- DESTINATIONS CRUD (write via Worker) ----------
+  /* ===================== DESTINATIONS (WRITE VIA WORKER) ===================== */
+
   const createDestination = async () => {
     const name = newDestName.trim();
     if (!name) return;
 
     setLoading(true);
     try {
-      await adminFetch("/api/destinations", {
-        token,
-        method: "POST",
-        body: { name }
-      });
+      await adminFetch("/api/destinations", { token, method: "POST", body: { name } });
       setNewDestName("");
       notify("Destination added ✅");
     } catch (e) {
@@ -192,8 +171,7 @@ export default function AdminRoutes() {
     }
   };
 
-  // Worker DOES NOT support bulk destinations yet.
-  // Keep UI but do it by calling POST repeatedly.
+  // No true bulk endpoint for destinations yet -> loop calls
   const bulkCreateDestinations = async () => {
     const names = parseBulkLines(bulkDestText);
     if (!names.length) return;
@@ -221,11 +199,7 @@ export default function AdminRoutes() {
 
     setLoading(true);
     try {
-      await adminFetch(`/api/destinations/${id}`, {
-        token,
-        method: "PATCH",
-        body: { name: name.trim() }
-      });
+      await adminFetch(`/api/destinations/${id}`, { token, method: "PATCH", body: { name: name.trim() } });
       notify("Destination renamed ✅");
     } catch (e) {
       notify("Rename failed: " + (e?.message || e));
@@ -235,8 +209,8 @@ export default function AdminRoutes() {
   };
 
   const deleteDestination = async (id) => {
-    const cascade = confirm("Delete destination?\n\nThis will also delete all stops for this destination.");
-    if (!cascade) return;
+    const ok = confirm("Delete destination?\n\nThis will ALSO delete all stops for this destination.");
+    if (!ok) return;
 
     setLoading(true);
     try {
@@ -250,14 +224,8 @@ export default function AdminRoutes() {
     }
   };
 
-  // ---------- STOPS CRUD (write via Worker) ----------
-  const nextStopOrder = useMemo(() => {
-    if (!stops.length) return 1;
-    return Math.max(...stops.map((s) => s.stop_order || 0)) + 1;
-  }, [stops]);
+  /* ===================== STOPS (WRITE VIA WORKER) ===================== */
 
-  // Worker currently supports bulk insert via /api/stops/bulk.
-  // For single stop, we call bulk with one line.
   const createStop = async () => {
     if (!selectedDestId) return;
     const name = newStopName.trim();
@@ -265,14 +233,7 @@ export default function AdminRoutes() {
 
     setLoading(true);
     try {
-      await adminFetch("/api/stops/bulk", {
-        token,
-        method: "POST",
-        body: {
-          destination_id: selectedDestId,
-          namesText: name
-        }
-      });
+      await adminFetch("/api/stops", { token, method: "POST", body: { destination_id: selectedDestId, name } });
       setNewStopName("");
       notify("Stop added ✅");
     } catch (e) {
@@ -292,10 +253,7 @@ export default function AdminRoutes() {
       await adminFetch("/api/stops/bulk", {
         token,
         method: "POST",
-        body: {
-          destination_id: selectedDestId,
-          namesText: names.join("\n")
-        }
+        body: { destination_id: selectedDestId, namesText: names.join("\n") }
       });
       setBulkStopText("");
       notify(`Added ${names.length} stop(s) ✅`);
@@ -306,9 +264,6 @@ export default function AdminRoutes() {
     }
   };
 
-  // Worker DOES NOT have stop rename/delete endpoints in the code you pasted.
-  // So these two must write directly to Supabase (safe if your current RLS allows it),
-  // OR you add endpoints later. For now, we do direct Supabase write to avoid breaking you.
   const renameStop = async (id) => {
     const cur = stops.find((s) => s.id === id);
     const name = prompt("Rename stop:", cur?.name || "");
@@ -316,8 +271,7 @@ export default function AdminRoutes() {
 
     setLoading(true);
     try {
-      const { error } = await supabase.from("route_stops").update({ name: name.trim() }).eq("id", id);
-      if (error) throw error;
+      await adminFetch(`/api/stops/${id}`, { token, method: "PATCH", body: { name: name.trim() } });
       notify("Stop renamed ✅");
     } catch (e) {
       notify("Rename stop failed: " + (e?.message || e));
@@ -331,8 +285,7 @@ export default function AdminRoutes() {
 
     setLoading(true);
     try {
-      const { error } = await supabase.from("route_stops").delete().eq("id", id);
-      if (error) throw error;
+      await adminFetch(`/api/stops/${id}`, { token, method: "DELETE" });
       notify("Stop deleted ✅");
     } catch (e) {
       notify("Delete stop failed: " + (e?.message || e));
@@ -341,7 +294,8 @@ export default function AdminRoutes() {
     }
   };
 
-  // ---------- REORDER (write via Worker) ----------
+  /* ===================== REORDER (WRITE VIA WORKER) ===================== */
+
   const moveStop = (id, dir) => {
     const idx = stops.findIndex((s) => s.id === id);
     if (idx < 0) return;
@@ -354,6 +308,7 @@ export default function AdminRoutes() {
     copy[idx] = copy[j];
     copy[j] = tmp;
 
+    // normalize stop_order visually
     const normalized = copy.map((s, k) => ({ ...s, stop_order: k + 1 }));
     setStops(normalized);
   };
@@ -363,12 +318,9 @@ export default function AdminRoutes() {
 
     setLoading(true);
     try {
-      const ordered_ids = stops.map((s) => s.id); // current UI order is the intended new order
-      await adminFetch("/api/stops/reorder", {
-        token,
-        method: "POST",
-        body: { ordered_ids }
-      });
+      // current UI order should be the order we save
+      const ordered_ids = stops.map((s) => s.id);
+      await adminFetch("/api/stops/reorder", { token, method: "POST", body: { ordered_ids } });
       notify("Order saved ✅");
     } catch (e) {
       notify("Save order failed: " + (e?.message || e));
@@ -377,7 +329,8 @@ export default function AdminRoutes() {
     }
   };
 
-  // ---------- UI ----------
+  /* ===================== UI ===================== */
+
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100">
       <Toast msg={toast} onClose={() => setToast("")} />
@@ -386,7 +339,7 @@ export default function AdminRoutes() {
         <div className="flex items-start justify-between gap-4">
           <div>
             <div className="text-2xl font-black">Trotro Admin</div>
-            <div className="text-sm text-zinc-400 mt-1">Realtime destinations + stops</div>
+            <div className="text-sm text-zinc-400 mt-1">Realtime destinations + stops • Writes via Worker</div>
           </div>
 
           <div className="w-full max-w-md rounded-2xl border border-white/10 bg-white/5 p-3">
@@ -398,7 +351,7 @@ export default function AdminRoutes() {
               className="mt-2 w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none"
             />
             <div className="mt-2 text-xs text-zinc-500">
-              Stored in sessionStorage. (If your Worker isn’t enforcing it yet, you can ignore this field.)
+              (Worker isn’t enforcing it yet, so this is optional for now.)
             </div>
           </div>
         </div>
@@ -438,9 +391,6 @@ export default function AdminRoutes() {
               >
                 Bulk add destinations
               </button>
-              <div className="mt-2 text-xs text-zinc-500">
-                Note: worker doesn’t have a true bulk endpoint for destinations yet — this loops POST calls.
-              </div>
             </div>
 
             <div className="mt-5">
