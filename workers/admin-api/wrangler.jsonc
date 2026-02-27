@@ -1,0 +1,16 @@
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "admin-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-02-26",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "observability": { "enabled": true },
+  "vars": {
+    "SUPABASE_URL": "https://yktzihpahinplyrpqtqj.supabase.co",
+    "ROUTE_ID": "11111111-1111-1111-1111-111111111111"
+  }
+}
