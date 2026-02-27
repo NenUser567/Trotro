@@ -24,7 +24,7 @@ const corsHeaders = (req: Request, env: Env) => {
   return {
     "Access-Control-Allow-Origin": allowOrigin,
     "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
-    "Access-Control-Allow-Headers": "content-type",
+    "Access-Control-Allow-Headers": "content-type, x-admin-token, authorization",
     "Access-Control-Max-Age": "86400"
   } as Record<string, string>;
 };
