@@ -8,7 +8,7 @@ export interface Env {
 const json = (data: any, status = 200, headers: HeadersInit = {}) =>
   new Response(JSON.stringify(data), {
     status,
-    headers: { "content-type": "application/json", ...headers }
+    headers: { "content-type": "application/json", ...headers },
   });
 
 const corsHeaders = (req: Request, env: Env) => {
@@ -18,13 +18,17 @@ const corsHeaders = (req: Request, env: Env) => {
     .map((s) => s.trim())
     .filter(Boolean);
 
-  const allowOrigin = allowed.length ? (allowed.includes(origin) ? origin : allowed[0]) : "*";
+  const allowOrigin = allowed.length
+    ? allowed.includes(origin)
+      ? origin
+      : allowed[0]
+    : "*";
 
   return {
     "Access-Control-Allow-Origin": allowOrigin,
     "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
     "Access-Control-Allow-Headers": "content-type, x-admin-token, authorization",
-    "Access-Control-Max-Age": "86400"
+    "Access-Control-Max-Age": "86400",
   } as Record<string, string>;
 };
 
@@ -35,8 +39,6 @@ const withCors = (req: Request, env: Env, res: Response) => {
   return new Response(res.body, { status: res.status, headers: h });
 };
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
 async function supabaseFetch(env: Env, path: string, init: RequestInit) {
   const url = env.SUPABASE_URL.replace(/\/$/, "") + path;
 
@@ -46,8 +48,8 @@ async function supabaseFetch(env: Env, path: string, init: RequestInit) {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
       Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
       "content-type": "application/json",
-      ...(init.headers || {})
-    }
+      ...(init.headers || {}),
+    },
   });
 
   const text = await res.text();
@@ -76,6 +78,18 @@ async function destinationExists(env: Env, destinationId: string) {
   );
   return Array.isArray(rows) && rows.length > 0;
 }
+
+const dedupePreserveOrder = (arr: string[]) => {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const x of arr) {
+    const v = String(x || "").trim();
+    if (!v || seen.has(v)) continue;
+    seen.add(v);
+    out.push(v);
+  }
+  return out;
+};
 
 export default {
   async fetch(req: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
@@ -113,7 +127,7 @@ export default {
         const data = await supabaseFetch(env, "/rest/v1/destinations", {
           method: "POST",
           headers: { Prefer: "return=representation" },
-          body: JSON.stringify({ name })
+          body: JSON.stringify({ name }),
         });
 
         return withCors(req, env, json({ ok: true, data }));
@@ -132,29 +146,26 @@ export default {
           const data = await supabaseFetch(env, `/rest/v1/destinations?id=eq.${encodeURIComponent(destId)}`, {
             method: "PATCH",
             headers: { Prefer: "return=representation" },
-            body: JSON.stringify({ name })
+            body: JSON.stringify({ name }),
           });
 
           const updatedCount = Array.isArray(data) ? data.length : 0;
           if (updatedCount === 0) return withCors(req, env, json({ error: "Destination not found" }, 404));
-
           return withCors(req, env, json({ ok: true, data }));
         }
 
         if (req.method === "DELETE") {
-          // delete stops first (FK safety)
           await supabaseFetch(env, `/rest/v1/route_stops?destination_id=eq.${encodeURIComponent(destId)}`, {
-            method: "DELETE"
+            method: "DELETE",
           });
 
           const data = await supabaseFetch(env, `/rest/v1/destinations?id=eq.${encodeURIComponent(destId)}`, {
             method: "DELETE",
-            headers: { Prefer: "return=representation" }
+            headers: { Prefer: "return=representation" },
           });
 
           const deletedCount = Array.isArray(data) ? data.length : 0;
           if (deletedCount === 0) return withCors(req, env, json({ error: "Destination not found" }, 404));
-
           return withCors(req, env, json({ ok: true, data }));
         }
       }
@@ -182,8 +193,7 @@ export default {
           { method: "GET" }
         );
 
-        const max =
-          Array.isArray(maxRow) && maxRow[0]?.stop_order != null ? Number(maxRow[0].stop_order) : 0;
+        const max = Array.isArray(maxRow) && maxRow[0]?.stop_order != null ? Number(maxRow[0].stop_order) : 0;
 
         const data = await supabaseFetch(env, "/rest/v1/route_stops", {
           method: "POST",
@@ -192,8 +202,8 @@ export default {
             route_id: env.ROUTE_ID,
             destination_id,
             name,
-            stop_order: max + 1
-          })
+            stop_order: max + 1,
+          }),
         });
 
         return withCors(req, env, json({ ok: true, data }));
@@ -209,12 +219,11 @@ export default {
         const data = await supabaseFetch(env, `/rest/v1/route_stops?id=eq.${encodeURIComponent(stopId)}`, {
           method: "PATCH",
           headers: { Prefer: "return=representation" },
-          body: JSON.stringify({ name })
+          body: JSON.stringify({ name }),
         });
 
         const updatedCount = Array.isArray(data) ? data.length : 0;
         if (updatedCount === 0) return withCors(req, env, json({ error: "Stop not found" }, 404));
-
         return withCors(req, env, json({ ok: true, data }));
       }
 
@@ -224,12 +233,11 @@ export default {
 
         const data = await supabaseFetch(env, `/rest/v1/route_stops?id=eq.${encodeURIComponent(stopId)}`, {
           method: "DELETE",
-          headers: { Prefer: "return=representation" }
+          headers: { Prefer: "return=representation" },
         });
 
         const deletedCount = Array.isArray(data) ? data.length : 0;
         if (deletedCount === 0) return withCors(req, env, json({ error: "Stop not found" }, 404));
-
         return withCors(req, env, json({ ok: true, data }));
       }
 
@@ -255,68 +263,51 @@ export default {
           { method: "GET" }
         );
 
-        const max =
-          Array.isArray(maxRow) && maxRow[0]?.stop_order != null ? Number(maxRow[0].stop_order) : 0;
+        const max = Array.isArray(maxRow) && maxRow[0]?.stop_order != null ? Number(maxRow[0].stop_order) : 0;
 
         const rows = names.map((name, i) => ({
           route_id: env.ROUTE_ID,
           destination_id,
           name,
-          stop_order: max + 1 + i
+          stop_order: max + 1 + i,
         }));
 
         const data = await supabaseFetch(env, "/rest/v1/route_stops", {
           method: "POST",
           headers: { Prefer: "return=representation" },
-          body: JSON.stringify(rows)
+          body: JSON.stringify(rows),
         });
 
         return withCors(req, env, json({ ok: true, inserted: Array.isArray(data) ? data.length : 0, data }));
       }
 
-      // POST /api/stops/reorder { ordered_ids: [] }
-      // FIXED: 2-phase reorder avoids unique constraint collisions mid-update
+      /* ===================== REORDER (ONE RPC CALL) ===================== */
+
+      // POST /api/stops/reorder { destination_id, ordered_ids: [] }
       if (parts[0] === "stops" && parts[1] === "reorder" && req.method === "POST") {
         const body = await req.json<any>();
-        const raw: string[] = Array.isArray(body?.ordered_ids) ? body.ordered_ids.map(String) : [];
+        const destination_id = String(body?.destination_id || "");
+        const raw = Array.isArray(body?.ordered_ids) ? body.ordered_ids : [];
+        const ordered_ids = dedupePreserveOrder(raw);
 
-        // de-dupe while preserving order
-        const seen = new Set<string>();
-        const ordered_ids = raw.filter((id) => {
-          if (!id) return false;
-          if (seen.has(id)) return false;
-          seen.add(id);
-          return true;
-        });
-
+        if (!destination_id) return withCors(req, env, json({ error: "destination_id required" }, 400));
         if (!ordered_ids.length) return withCors(req, env, json({ error: "ordered_ids required" }, 400));
 
-        // Phase 1: set unique negative orders first (no collisions)
-        for (let i = 0; i < ordered_ids.length; i++) {
-          const id = ordered_ids[i];
-          await supabaseFetch(env, `/rest/v1/route_stops?id=eq.${encodeURIComponent(id)}`, {
-            method: "PATCH",
-            body: JSON.stringify({ stop_order: -(i + 1) })
-          });
-          await sleep(5);
-        }
+        const data = await supabaseFetch(env, "/rest/v1/rpc/reorder_route_stops", {
+          method: "POST",
+          body: JSON.stringify({
+            p_route_id: env.ROUTE_ID,
+            p_destination_id: destination_id,
+            p_ordered_ids: ordered_ids,
+          }),
+        });
 
-        // Phase 2: set final 1..n
-        for (let i = 0; i < ordered_ids.length; i++) {
-          const id = ordered_ids[i];
-          await supabaseFetch(env, `/rest/v1/route_stops?id=eq.${encodeURIComponent(id)}`, {
-            method: "PATCH",
-            body: JSON.stringify({ stop_order: i + 1 })
-          });
-          await sleep(5);
-        }
-
-        return withCors(req, env, json({ ok: true, count: ordered_ids.length }));
+        return withCors(req, env, json(data));
       }
 
       return withCors(req, env, json({ error: "Not found" }, 404));
     } catch (e: any) {
       return withCors(req, env, json({ error: e?.message || String(e) }, 500));
     }
-  }
+  },
 };

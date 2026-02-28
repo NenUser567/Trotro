@@ -13,9 +13,9 @@ async function adminFetch(path, { token, method = "GET", body } = {}) {
     method,
     headers: {
       "content-type": "application/json",
-      "x-admin-token": token || ""
+      "x-admin-token": token || "",
     },
-    body: body ? JSON.stringify(body) : undefined
+    body: body ? JSON.stringify(body) : undefined,
   });
 
   const data = await res.json().catch(() => ({}));
@@ -64,16 +64,14 @@ export default function AdminRoutes() {
   // Forms
   const [newDestName, setNewDestName] = useState("");
   const [bulkDestText, setBulkDestText] = useState("");
-
   const [newStopName, setNewStopName] = useState("");
   const [bulkStopText, setBulkStopText] = useState("");
 
-  // Keep scroll stable when stops update
+  // Scroll + reorder protection
   const stopsListRef = useRef(null);
-
-  // When user is actively reordering, avoid realtime overwriting the list
   const [dirtyOrder, setDirtyOrder] = useState(false);
   const dirtyOrderRef = useRef(false);
+
   useEffect(() => {
     dirtyOrderRef.current = dirtyOrder;
   }, [dirtyOrder]);
@@ -88,13 +86,11 @@ export default function AdminRoutes() {
     if (error) throw error;
 
     setDestinations(data || []);
-
-    // Keep selection stable if possible
     if (!selectedDestId && data?.[0]?.id) setSelectedDestId(data[0].id);
   };
 
   // ---------- READ: STOPS ----------
-  const loadStops = async (destId, { preserveScroll = true } = {}) => {
+  const loadStops = async (destId, { preserveScroll = true, force = false } = {}) => {
     if (!destId) {
       setStops([]);
       return;
@@ -112,12 +108,8 @@ export default function AdminRoutes() {
 
     if (error) throw error;
 
-    // IMPORTANT:
-    // If user is actively reordering (dirtyOrder), don't overwrite their local list
-    // unless the destination changed.
-    if (!dirtyOrderRef.current) {
-      setStops(data || []);
-    }
+    // Don’t clobber local reorder while user is rearranging
+    if (force || !dirtyOrderRef.current) setStops(data || []);
 
     if (el && prevTop != null) el.scrollTop = prevTop;
   };
@@ -131,11 +123,11 @@ export default function AdminRoutes() {
   // load stops when destination changes
   useEffect(() => {
     setDirtyOrder(false);
-    loadStops(selectedDestId).catch((e) => notify("Failed to load stops: " + (e?.message || e)));
+    loadStops(selectedDestId, { force: true }).catch((e) => notify("Failed to load stops: " + (e?.message || e)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedDestId]);
 
-  // ---------- REALTIME (READ DIRECT) ----------
+  // ---------- REALTIME ----------
   useEffect(() => {
     const ch1 = supabase
       .channel("admin_destinations_realtime")
@@ -155,15 +147,9 @@ export default function AdminRoutes() {
       .channel("admin_stops_realtime_" + selectedDestId)
       .on(
         "postgres_changes",
-        {
-          event: "*",
-          schema: "public",
-          table: "route_stops",
-          filter: `destination_id=eq.${selectedDestId}`
-        },
+        { event: "*", schema: "public", table: "route_stops", filter: `destination_id=eq.${selectedDestId}` },
         () => {
-          // If user is reordering (dirtyOrder), don't clobber their ordering.
-          // They'll refresh automatically after saving.
+          // If user is reordering, don’t overwrite the local list
           if (dirtyOrderRef.current) return;
           loadStops(selectedDestId).catch(() => {});
         }
@@ -192,7 +178,6 @@ export default function AdminRoutes() {
     }
   };
 
-  // loop calls
   const bulkCreateDestinations = async () => {
     const names = parseBulkLines(bulkDestText);
     if (!names.length) return;
@@ -254,11 +239,11 @@ export default function AdminRoutes() {
 
     setLoading(true);
     try {
-      // Use bulk endpoint with one line (matches your Worker)
+      // Uses bulk endpoint with 1 line
       await adminFetch("/api/stops/bulk", {
         token,
         method: "POST",
-        body: { destination_id: selectedDestId, namesText: name }
+        body: { destination_id: selectedDestId, namesText: name },
       });
       setNewStopName("");
       notify("Stop added ✅");
@@ -279,7 +264,7 @@ export default function AdminRoutes() {
       await adminFetch("/api/stops/bulk", {
         token,
         method: "POST",
-        body: { destination_id: selectedDestId, namesText: names.join("\n") }
+        body: { destination_id: selectedDestId, namesText: names.join("\n") },
       });
       setBulkStopText("");
       notify(`Added ${names.length} stop(s) ✅`);
@@ -320,7 +305,7 @@ export default function AdminRoutes() {
     }
   };
 
-  /* ===================== REORDER (WRITE VIA WORKER) ===================== */
+  /* ===================== REORDER (WRITE VIA WORKER, ONE CALL) ===================== */
 
   const moveStop = (id, dir) => {
     const idx = stops.findIndex((s) => s.id === id);
@@ -334,7 +319,7 @@ export default function AdminRoutes() {
     copy[idx] = copy[j];
     copy[j] = tmp;
 
-    // Normalize local display order (1..n), but do not save yet
+    // Normalize local view; we do NOT save yet
     const normalized = copy.map((s, k) => ({ ...s, stop_order: k + 1 }));
     setStops(normalized);
     setDirtyOrder(true);
@@ -345,19 +330,15 @@ export default function AdminRoutes() {
 
     setLoading(true);
     try {
-      // IMPORTANT: send in the current UI order (do NOT sort again here)
-      const ordered_ids = stops.map((s) => s.id);
-
+      const ordered_ids = stops.map((s) => s.id); // current UI order, DO NOT sort
       await adminFetch("/api/stops/reorder", {
         token,
         method: "POST",
-        body: { ordered_ids }
+        body: { destination_id: selectedDestId, ordered_ids },
       });
 
       setDirtyOrder(false);
-      // reload from DB to reflect canonical orders
-      await loadStops(selectedDestId, { preserveScroll: true });
-
+      await loadStops(selectedDestId, { force: true });
       notify("Order saved ✅");
     } catch (e) {
       notify("Save order failed: " + (e?.message || e));
@@ -390,7 +371,7 @@ export default function AdminRoutes() {
               placeholder="Paste your admin token here"
               className="mt-2 w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none"
             />
-            <div className="mt-2 text-xs text-zinc-500">(Worker isn’t enforcing it yet, so this is optional for now.)</div>
+            <div className="mt-2 text-xs text-zinc-500">(Optional unless you enforce it later.)</div>
           </div>
         </div>
 
@@ -521,7 +502,7 @@ export default function AdminRoutes() {
                 disabled={loading || !selectedDestId}
                 onClick={() => {
                   setDirtyOrder(false);
-                  loadStops(selectedDestId).catch(() => {});
+                  loadStops(selectedDestId, { force: true }).catch(() => {});
                   notify("Refreshed ✅");
                 }}
                 className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm font-semibold hover:bg-white/10 disabled:opacity-60"
@@ -530,10 +511,7 @@ export default function AdminRoutes() {
               </button>
             </div>
 
-            <div
-              ref={stopsListRef}
-              className="mt-4 max-h-[52vh] overflow-auto rounded-2xl border border-white/10 bg-black/20"
-            >
+            <div ref={stopsListRef} className="mt-4 max-h-[52vh] overflow-auto rounded-2xl border border-white/10 bg-black/20">
               {stops.length === 0 ? (
                 <div className="p-4 text-sm text-zinc-500">No stops yet.</div>
               ) : (
@@ -585,7 +563,7 @@ export default function AdminRoutes() {
             </div>
 
             <div className="mt-3 text-xs text-zinc-500">
-              Tip: reorder with ↑ ↓ then hit <b>Save order</b>. Realtime updates won’t overwrite your reorder until you save.
+              Tip: reorder with ↑ ↓ then hit <b>Save order</b>. While reordering, realtime won’t overwrite your list.
             </div>
           </div>
         </div>
