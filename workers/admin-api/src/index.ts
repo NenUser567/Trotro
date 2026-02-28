@@ -23,7 +23,6 @@ const corsHeaders = (req: Request, env: Env) => {
   return {
     "Access-Control-Allow-Origin": allowOrigin,
     "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
-    // IMPORTANT: allow x-admin-token so browser doesn't block your requests
     "Access-Control-Allow-Headers": "content-type, x-admin-token, authorization",
     "Access-Control-Max-Age": "86400"
   } as Record<string, string>;
@@ -276,21 +275,43 @@ export default {
       }
 
       // POST /api/stops/reorder { ordered_ids: [] }
+      // FIXED: 2-phase reorder avoids unique constraint collisions mid-update
       if (parts[0] === "stops" && parts[1] === "reorder" && req.method === "POST") {
         const body = await req.json<any>();
-        const ordered_ids: string[] = Array.isArray(body?.ordered_ids) ? body.ordered_ids : [];
+        const raw: string[] = Array.isArray(body?.ordered_ids) ? body.ordered_ids.map(String) : [];
+
+        // de-dupe while preserving order
+        const seen = new Set<string>();
+        const ordered_ids = raw.filter((id) => {
+          if (!id) return false;
+          if (seen.has(id)) return false;
+          seen.add(id);
+          return true;
+        });
+
         if (!ordered_ids.length) return withCors(req, env, json({ error: "ordered_ids required" }, 400));
 
-        // update stop_order sequentially
+        // Phase 1: set unique negative orders first (no collisions)
         for (let i = 0; i < ordered_ids.length; i++) {
-          await supabaseFetch(env, `/rest/v1/route_stops?id=eq.${encodeURIComponent(ordered_ids[i])}`, {
+          const id = ordered_ids[i];
+          await supabaseFetch(env, `/rest/v1/route_stops?id=eq.${encodeURIComponent(id)}`, {
+            method: "PATCH",
+            body: JSON.stringify({ stop_order: -(i + 1) })
+          });
+          await sleep(5);
+        }
+
+        // Phase 2: set final 1..n
+        for (let i = 0; i < ordered_ids.length; i++) {
+          const id = ordered_ids[i];
+          await supabaseFetch(env, `/rest/v1/route_stops?id=eq.${encodeURIComponent(id)}`, {
             method: "PATCH",
             body: JSON.stringify({ stop_order: i + 1 })
           });
           await sleep(5);
         }
 
-        return withCors(req, env, json({ ok: true }));
+        return withCors(req, env, json({ ok: true, count: ordered_ids.length }));
       }
 
       return withCors(req, env, json({ error: "Not found" }, 404));

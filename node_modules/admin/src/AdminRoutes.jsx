@@ -42,6 +42,7 @@ function Toast({ msg, onClose }) {
 export default function AdminRoutes() {
   const [token, setToken] = useState(() => sessionStorage.getItem("admin_token") || "");
   const [toast, setToast] = useState("");
+  const [loading, setLoading] = useState(false);
 
   const notify = (m) => {
     setToast(m);
@@ -54,6 +55,7 @@ export default function AdminRoutes() {
 
   // UI state
   const [selectedDestId, setSelectedDestId] = useState("");
+
   const selectedDest = useMemo(
     () => destinations.find((d) => d.id === selectedDestId) || null,
     [destinations, selectedDestId]
@@ -66,10 +68,15 @@ export default function AdminRoutes() {
   const [newStopName, setNewStopName] = useState("");
   const [bulkStopText, setBulkStopText] = useState("");
 
-  const [loading, setLoading] = useState(false);
-
   // Keep scroll stable when stops update
   const stopsListRef = useRef(null);
+
+  // When user is actively reordering, avoid realtime overwriting the list
+  const [dirtyOrder, setDirtyOrder] = useState(false);
+  const dirtyOrderRef = useRef(false);
+  useEffect(() => {
+    dirtyOrderRef.current = dirtyOrder;
+  }, [dirtyOrder]);
 
   useEffect(() => {
     sessionStorage.setItem("admin_token", token);
@@ -79,24 +86,40 @@ export default function AdminRoutes() {
   const loadDestinations = async () => {
     const { data, error } = await supabase.from("destinations").select("id,name").order("name");
     if (error) throw error;
+
     setDestinations(data || []);
+
+    // Keep selection stable if possible
     if (!selectedDestId && data?.[0]?.id) setSelectedDestId(data[0].id);
   };
 
   // ---------- READ: STOPS ----------
-  const loadStops = async (destId) => {
+  const loadStops = async (destId, { preserveScroll = true } = {}) => {
     if (!destId) {
       setStops([]);
       return;
     }
+
+    const el = stopsListRef.current;
+    const prevTop = preserveScroll && el ? el.scrollTop : null;
+
     const { data, error } = await supabase
       .from("route_stops")
       .select("id,name,stop_order,route_id,destination_id")
       .eq("route_id", ROUTE_ID)
       .eq("destination_id", destId)
       .order("stop_order");
+
     if (error) throw error;
-    setStops(data || []);
+
+    // IMPORTANT:
+    // If user is actively reordering (dirtyOrder), don't overwrite their local list
+    // unless the destination changed.
+    if (!dirtyOrderRef.current) {
+      setStops(data || []);
+    }
+
+    if (el && prevTop != null) el.scrollTop = prevTop;
   };
 
   // initial load
@@ -107,6 +130,7 @@ export default function AdminRoutes() {
 
   // load stops when destination changes
   useEffect(() => {
+    setDirtyOrder(false);
     loadStops(selectedDestId).catch((e) => notify("Failed to load stops: " + (e?.message || e)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedDestId]);
@@ -120,9 +144,7 @@ export default function AdminRoutes() {
       })
       .subscribe();
 
-    return () => {
-      supabase.removeChannel(ch1);
-    };
+    return () => supabase.removeChannel(ch1);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -133,23 +155,22 @@ export default function AdminRoutes() {
       .channel("admin_stops_realtime_" + selectedDestId)
       .on(
         "postgres_changes",
-        { event: "*", schema: "public", table: "route_stops", filter: `destination_id=eq.${selectedDestId}` },
+        {
+          event: "*",
+          schema: "public",
+          table: "route_stops",
+          filter: `destination_id=eq.${selectedDestId}`
+        },
         () => {
-          const el = stopsListRef.current;
-          const prevTop = el ? el.scrollTop : null;
-
-          loadStops(selectedDestId)
-            .then(() => {
-              if (el && prevTop != null) el.scrollTop = prevTop;
-            })
-            .catch(() => {});
+          // If user is reordering (dirtyOrder), don't clobber their ordering.
+          // They'll refresh automatically after saving.
+          if (dirtyOrderRef.current) return;
+          loadStops(selectedDestId).catch(() => {});
         }
       )
       .subscribe();
 
-    return () => {
-      supabase.removeChannel(ch2);
-    };
+    return () => supabase.removeChannel(ch2);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedDestId]);
 
@@ -171,7 +192,7 @@ export default function AdminRoutes() {
     }
   };
 
-  // No true bulk endpoint for destinations yet -> loop calls
+  // loop calls
   const bulkCreateDestinations = async () => {
     const names = parseBulkLines(bulkDestText);
     if (!names.length) return;
@@ -233,7 +254,12 @@ export default function AdminRoutes() {
 
     setLoading(true);
     try {
-      await adminFetch("/api/stops", { token, method: "POST", body: { destination_id: selectedDestId, name } });
+      // Use bulk endpoint with one line (matches your Worker)
+      await adminFetch("/api/stops/bulk", {
+        token,
+        method: "POST",
+        body: { destination_id: selectedDestId, namesText: name }
+      });
       setNewStopName("");
       notify("Stop added ✅");
     } catch (e) {
@@ -308,9 +334,10 @@ export default function AdminRoutes() {
     copy[idx] = copy[j];
     copy[j] = tmp;
 
-    // normalize stop_order visually
+    // Normalize local display order (1..n), but do not save yet
     const normalized = copy.map((s, k) => ({ ...s, stop_order: k + 1 }));
     setStops(normalized);
+    setDirtyOrder(true);
   };
 
   const saveOrder = async () => {
@@ -318,9 +345,19 @@ export default function AdminRoutes() {
 
     setLoading(true);
     try {
-      // current UI order should be the order we save
+      // IMPORTANT: send in the current UI order (do NOT sort again here)
       const ordered_ids = stops.map((s) => s.id);
-      await adminFetch("/api/stops/reorder", { token, method: "POST", body: { ordered_ids } });
+
+      await adminFetch("/api/stops/reorder", {
+        token,
+        method: "POST",
+        body: { ordered_ids }
+      });
+
+      setDirtyOrder(false);
+      // reload from DB to reflect canonical orders
+      await loadStops(selectedDestId, { preserveScroll: true });
+
       notify("Order saved ✅");
     } catch (e) {
       notify("Save order failed: " + (e?.message || e));
@@ -339,7 +376,10 @@ export default function AdminRoutes() {
         <div className="flex items-start justify-between gap-4">
           <div>
             <div className="text-2xl font-black">Trotro Admin</div>
-            <div className="text-sm text-zinc-400 mt-1">Realtime destinations + stops • Writes via Worker</div>
+            <div className="text-sm text-zinc-400 mt-1">
+              Realtime destinations + stops • Writes via Worker
+              {dirtyOrder ? <span className="ml-2 text-amber-300">(unsaved order)</span> : null}
+            </div>
           </div>
 
           <div className="w-full max-w-md rounded-2xl border border-white/10 bg-white/5 p-3">
@@ -350,9 +390,7 @@ export default function AdminRoutes() {
               placeholder="Paste your admin token here"
               className="mt-2 w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none"
             />
-            <div className="mt-2 text-xs text-zinc-500">
-              (Worker isn’t enforcing it yet, so this is optional for now.)
-            </div>
+            <div className="mt-2 text-xs text-zinc-500">(Worker isn’t enforcing it yet, so this is optional for now.)</div>
           </div>
         </div>
 
@@ -478,6 +516,18 @@ export default function AdminRoutes() {
               >
                 Save order
               </button>
+
+              <button
+                disabled={loading || !selectedDestId}
+                onClick={() => {
+                  setDirtyOrder(false);
+                  loadStops(selectedDestId).catch(() => {});
+                  notify("Refreshed ✅");
+                }}
+                className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm font-semibold hover:bg-white/10 disabled:opacity-60"
+              >
+                Refresh
+              </button>
             </div>
 
             <div
@@ -488,65 +538,62 @@ export default function AdminRoutes() {
                 <div className="p-4 text-sm text-zinc-500">No stops yet.</div>
               ) : (
                 <div className="divide-y divide-white/10">
-                  {stops
-                    .slice()
-                    .sort((a, b) => (a.stop_order || 0) - (b.stop_order || 0))
-                    .map((s, idx) => (
-                      <div key={s.id} className="p-3 flex items-center justify-between gap-3">
-                        <div className="min-w-0">
-                          <div className="text-sm font-semibold truncate">
-                            {idx + 1}. {s.name}
-                          </div>
-                          <div className="text-xs text-zinc-500">id: {s.id.slice(0, 8)}…</div>
+                  {stops.map((s, idx) => (
+                    <div key={s.id} className="p-3 flex items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="text-sm font-semibold truncate">
+                          {idx + 1}. {s.name}
                         </div>
-
-                        <div className="flex items-center gap-2">
-                          <button
-                            onClick={() => moveStop(s.id, "up")}
-                            className="rounded-xl border border-white/10 bg-white/10 px-3 py-2 text-xs font-semibold hover:bg-white/15"
-                            title="Move up"
-                          >
-                            ↑
-                          </button>
-                          <button
-                            onClick={() => moveStop(s.id, "down")}
-                            className="rounded-xl border border-white/10 bg-white/10 px-3 py-2 text-xs font-semibold hover:bg-white/15"
-                            title="Move down"
-                          >
-                            ↓
-                          </button>
-
-                          <button
-                            disabled={loading}
-                            onClick={() => renameStop(s.id)}
-                            className="rounded-xl border border-white/10 bg-white/10 px-3 py-2 text-xs font-semibold hover:bg-white/15 disabled:opacity-60"
-                          >
-                            Rename
-                          </button>
-                          <button
-                            disabled={loading}
-                            onClick={() => deleteStop(s.id)}
-                            className="rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs font-semibold text-red-200 hover:bg-red-500/15 disabled:opacity-60"
-                          >
-                            Delete
-                          </button>
-                        </div>
+                        <div className="text-xs text-zinc-500">id: {s.id.slice(0, 8)}…</div>
                       </div>
-                    ))}
+
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => moveStop(s.id, "up")}
+                          className="rounded-xl border border-white/10 bg-white/10 px-3 py-2 text-xs font-semibold hover:bg-white/15"
+                          title="Move up"
+                        >
+                          ↑
+                        </button>
+                        <button
+                          onClick={() => moveStop(s.id, "down")}
+                          className="rounded-xl border border-white/10 bg-white/10 px-3 py-2 text-xs font-semibold hover:bg-white/15"
+                          title="Move down"
+                        >
+                          ↓
+                        </button>
+
+                        <button
+                          disabled={loading}
+                          onClick={() => renameStop(s.id)}
+                          className="rounded-xl border border-white/10 bg-white/10 px-3 py-2 text-xs font-semibold hover:bg-white/15 disabled:opacity-60"
+                        >
+                          Rename
+                        </button>
+                        <button
+                          disabled={loading}
+                          onClick={() => deleteStop(s.id)}
+                          className="rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs font-semibold text-red-200 hover:bg-red-500/15 disabled:opacity-60"
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    </div>
+                  ))}
                 </div>
               )}
             </div>
 
             <div className="mt-3 text-xs text-zinc-500">
-              Tip: reorder with ↑ ↓ then hit <b>Save order</b>. Realtime updates don’t reset your scroll.
+              Tip: reorder with ↑ ↓ then hit <b>Save order</b>. Realtime updates won’t overwrite your reorder until you save.
             </div>
           </div>
         </div>
 
         <div className="mt-8 text-xs text-zinc-500">
-          ROUTE_ID: <span className="text-zinc-300">{ROUTE_ID || "(missing VITE_ROUTE_ID)"}</span>
+          ROUTE_ID: <span className="text-zinc-300">{ROUTE_ID || "(missing)"}</span>
           <br />
-          Admin API: <span className="text-zinc-300">{ADMIN_API_BASE || "(missing VITE_ADMIN_API_BASE)"}</span>
+          Admin API: <span className="text-zinc-300">{ADMIN_API_BASE || "(missing)"}</span>
         </div>
       </div>
     </div>
